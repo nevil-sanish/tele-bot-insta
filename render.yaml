@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: reel-brain
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET   # letters, digits, _ and - only (Telegram rule)
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: APIFY_TOKEN
+        sync: false
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_DATABASE_ID
+        sync: false
+      - key: COBALT_URL
+        sync: false

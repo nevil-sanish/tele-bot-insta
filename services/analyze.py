@@ -17,6 +17,7 @@ from app import config
 from fetchers.base import MediaFile, new_tmp_path
 
 from . import keys
+from .spec import FIELDS, LIST_FIELDS, SPEC
 
 log = logging.getLogger(__name__)
 
@@ -32,8 +33,8 @@ class ReelAnalysis(BaseModel):
     category: str = ""
 
 
-_FIELDS = list(ReelAnalysis.model_fields)
-_LIST_FIELDS = {"key_ideas", "tools", "tags"}
+_FIELDS = FIELDS
+_LIST_FIELDS = LIST_FIELDS
 # Every field required, no defaults: the model always fills the full shape.
 RESPONSE_SCHEMA = {
     "type": "OBJECT",
@@ -58,23 +59,12 @@ class AnalysisError(Exception):
     pass
 
 
-INSTRUCTIONS = """You extract knowledge from an Instagram reel/post for a personal notes library.
-Return JSON only, matching the schema. Rules:
-- title: short and specific (max 10 words).
-- summary: at most 4 sentences.
-- key_ideas: at most 5 short bullet points.
-- on_screen_text: important text shown on screen, deduplicated; "" if none.
-- transcript: verbatim speech if it is 150 words or fewer, otherwise a condensed version; "" if no speech.
-- tools: apps, products, libraries, websites or books mentioned.
-- tags: 3-6 lowercase topic tags without '#'.
-- category: one word or short phrase (e.g. tech, fitness, finance, cooking, productivity).
-- Do NOT repeat the caption, its URLs or its hashtags; they are stored separately.
-- Write in English."""
+INSTRUCTIONS = SPEC["instructions"]
 
 
 def _prompt(caption: str | None) -> str:
     caption = (caption or "").strip()
-    return f"{INSTRUCTIONS}\n\nCaption (context only):\n{caption[:3000] if caption else '(none)'}"
+    return f"{INSTRUCTIONS}\n\nCaption (context only):\n{caption[:SPEC['caption_max_chars']] if caption else '(none)'}"
 
 
 # ---------------------------------------------------------------- Gemini
@@ -342,8 +332,8 @@ async def _analyze_groq(media: list[MediaFile], caption: str | None) -> Analysis
 
     schema = json.dumps(ReelAnalysis().model_dump())
     user = (
-        f"{_prompt(caption)}\n\nYou cannot see the video; on_screen_text must be \"\".\n"
-        f"Schema: {schema}\n\nSpeech transcript:\n{transcript[:8000] or '(no speech)'}"
+        f"{_prompt(caption)}\n\n{SPEC['backup']['note']}\n"
+        f"Schema: {schema}\n\nSpeech transcript:\n{transcript[:SPEC['backup']['transcript_max_chars']] or '(no speech)'}"
     )
     data = ReelAnalysis.model_validate(_clean(await groq_json("Return only a JSON object.", user)))
     if not data.transcript and transcript:

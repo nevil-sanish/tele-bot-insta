@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "about": "Single source of truth for reel analysis, shared by the server (services/analyze.py) and the Android app (mobile/assets/analysis_spec.json must be an exact copy).",
+  "instructions": "You extract knowledge from an Instagram reel/post for a personal notes library.\nReturn JSON only, matching the schema. Rules:\n- title: short and specific (max 10 words).\n- summary: at most 4 sentences.\n- key_ideas: at most 5 short bullet points.\n- on_screen_text: important text shown on screen, deduplicated; \"\" if none.\n- transcript: verbatim speech if it is 150 words or fewer, otherwise a condensed version; \"\" if no speech.\n- tools: apps, products, libraries, websites or books mentioned.\n- tags: 3-6 lowercase topic tags without '#'.\n- category: one word or short phrase (e.g. tech, fitness, finance, cooking, productivity).\n- Do NOT repeat the caption, its URLs or its hashtags; they are stored separately.\n- Write in English.",
+  "caption_max_chars": 3000,
+  "fields": [
+    {
+      "name": "title",
+      "type": "string"
+    },
+    {
+      "name": "summary",
+      "type": "string"
+    },
+    {
+      "name": "key_ideas",
+      "type": "list"
+    },
+    {
+      "name": "on_screen_text",
+      "type": "string"
+    },
+    {
+      "name": "transcript",
+      "type": "string"
+    },
+    {
+      "name": "tools",
+      "type": "list"
+    },
+    {
+      "name": "tags",
+      "type": "list"
+    },
+    {
+      "name": "category",
+      "type": "string"
+    }
+  ],
+  "gemini": {
+    "models": [
+      "gemini-3.5-flash",
+      "gemini-3.8-flash",
+      "gemini-3.5-flash-lite"
+    ],
+    "media_resolution": "MEDIA_RESOLUTION_LOW",
+    "video_fps": 0.5,
+    "video_max_seconds": 90,
+    "inline_limit_mb": 19,
+    "max_output_tokens": 2048,
+    "temperature": 0.2,
+    "thinking_levels": [
+      "MINIMAL",
+      "LOW"
+    ]
+  },
+  "backup": {
+    "note": "You cannot see the video. Use the speech transcript and any on-screen text given below; on_screen_text must be \"\" if none is given.",
+    "transcript_max_chars": 8000
+  },
+  "chat": {
+    "reel_system": "You answer questions about one Instagram reel using only the reel data given. If the answer isn't in the data, say so briefly. Be concise; plain text, no markdown tables.",
+    "library_system": "You answer questions using the user's saved reel library. Use only the reels given. Cite the reels you use as [1], [2], … matching their numbers. If none are relevant, say so. Be concise; plain text, no markdown tables.",
+    "history_turns": 4,
+    "prompt_char_budget": 14000,
+    "search_top_k": 3
+  }
+}

@@ -63,8 +63,7 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for url in urls:
         status = await msg.reply_text("⏳ Processing…")
         job = Job(chat_id=msg.chat_id, status_message_id=status.message_id, url=url)
-        if not _worker(context).submit(job):
-            await status.edit_text("⏳ Already processing this one…")
+        await _worker(context).handle(job)
 
 
 async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -97,8 +96,7 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         file_unique_id=media.file_unique_id,
         mime_type=mime,
     )
-    if not _worker(context).submit(job):
-        await status.edit_text("⏳ Already processing this one…")
+    await _worker(context).handle(job)
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -112,8 +110,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=msg.chat_id, status_message_id=status.message_id, url=url,
         file_id=photo.file_id, file_unique_id=photo.file_unique_id, mime_type="image/jpeg",
     )
-    if not _worker(context).submit(job):
-        await status.edit_text("⏳ Already processing this one…")
+    await _worker(context).handle(job)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

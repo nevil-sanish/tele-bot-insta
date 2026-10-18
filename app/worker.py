@@ -40,7 +40,8 @@ class Worker:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
         self.queue: asyncio.Queue[Job] = asyncio.Queue()
-        self.in_flight: set[str] = set()
+        # shortcode -> jobs from other chats that asked for the same reel while it was running
+        self.in_flight: dict[str, list[Job]] = {}
         self._tasks: list[asyncio.Task] = []
 
     def start(self, n: int = config.WORKER_CONCURRENCY) -> None:
@@ -51,11 +52,20 @@ class Worker:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
+    async def handle(self, job: Job) -> None:
+        """Entry point for every reel: saved results are shown at once, new reels are queued."""
+        if await show_cached(self.bot, job):
+            return
+        if not self.submit(job):
+            await _status(self.bot, job, "⏳ This reel is being analyzed right now. I'll post the result here.")
+
     def submit(self, job: Job) -> bool:
-        """False if this reel is already queued/processing (Telegram retries, double sends)."""
+        """Queue a reel. If it's already queued/running, the job waits for that run instead
+        (it then gets the saved result) and this returns False."""
         if job.shortcode in self.in_flight:
+            self.in_flight[job.shortcode].append(job)
             return False
-        self.in_flight.add(job.shortcode)
+        self.in_flight[job.shortcode] = []
         self.queue.put_nowait(job)
         return True
 
@@ -63,13 +73,20 @@ class Worker:
         while True:
             job = await self.queue.get()
             try:
-                await process(self.bot, job)
-            except Exception:
-                log.exception("job crashed: %s", job)
-                await _status(self.bot, job, "❌ Something went wrong. Try /retry later.")
+                await self._run(job)
+                # Chats that sent the same reel meanwhile now get the saved result (0 tokens).
+                for waiter in self.in_flight.pop(job.shortcode, []):
+                    await self._run(waiter)
             finally:
-                self.in_flight.discard(job.shortcode)
+                self.in_flight.pop(job.shortcode, None)
                 self.queue.task_done()
+
+    async def _run(self, job: Job) -> None:
+        try:
+            await process(self.bot, job)
+        except Exception:
+            log.exception("job crashed: %s", job)
+            await _status(self.bot, job, "❌ Something went wrong. Try /retry later.")
 
 
 # ---------------------------------------------------------------- pipeline
@@ -79,17 +96,9 @@ async def process(bot: Bot, job: Job) -> None:
     shortcode = job.shortcode
     link = cap.canonical_url(shortcode) if job.url else ""
 
-    # 1. Cache: already in Notion → 0 tokens.
-    if store.enabled:
-        try:
-            cached = await store.find(shortcode)
-        except Exception as e:
-            log.warning("notion cache lookup failed: %s", e)
-            cached = None
-        if cached:
-            chat.set_active(job.chat_id, cached)
-            await _status(bot, job, format_result(cached, cached=True), reel=cached)
-            return
+    # 1. Cache: already in Notion (analyzed by anyone) → show it, 0 tokens.
+    if await show_cached(bot, job):
+        return
 
     # 2. Fetch (or download the forwarded file).
     await _status(bot, job, "📥 Fetching…")
@@ -151,6 +160,23 @@ async def process(bot: Bot, job: Job) -> None:
             job.chat_id,
             "Tip: send the video with the reel link as its caption to include the original caption.",
         )
+
+
+async def show_cached(bot: Bot, job: Job) -> bool:
+    """If this reel is already in the Notion library, show the saved result and return True."""
+    if not store.enabled:
+        return False
+    try:
+        cached = await store.find(job.shortcode)
+    except Exception as e:
+        log.warning("notion cache lookup failed: %s", e)
+        return False
+    if not cached:
+        return False
+    log.info("cache hit: %s", job.shortcode)
+    chat.set_active(job.chat_id, cached)
+    await _status(bot, job, format_result(cached, cached=True), reel=cached)
+    return True
 
 
 def build_reel(shortcode: str, link: str, fetched: FetchResult, caption_text: str, result) -> Reel:

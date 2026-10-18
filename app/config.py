@@ -40,17 +40,25 @@ TELEGRAM_MAX_FILE_MB = 20
 GEMINI_API_KEY = _str("GEMINI_API_KEY")
 GROQ_API_KEY = _str("GROQ_API_KEY")
 APIFY_TOKEN = _str("APIFY_TOKEN")
+# Several keys per provider (comma-separated) are rotated; the singular
+# variable still works for one key.
+GEMINI_API_KEYS = _list("GEMINI_API_KEYS") or ([GEMINI_API_KEY] if GEMINI_API_KEY else [])
+GROQ_API_KEYS = _list("GROQ_API_KEYS") or ([GROQ_API_KEY] if GROQ_API_KEY else [])
 COBALT_URL = _str("COBALT_URL")
 COBALT_API_KEY = _str("COBALT_API_KEY")
 
 # --- Database + accounts ---
 DATABASE_URL = _str("DATABASE_URL")  # Neon Postgres connection string
+# Direct (non-pooled) connection for LISTEN/NOTIFY; derived from DATABASE_URL if unset.
+DATABASE_LISTEN_URL = _str("DATABASE_LISTEN_URL")
 APP_SECRET = _str("APP_SECRET")  # signs app login tokens (any long random string)
 # OAuth client IDs whose Google ID tokens we accept (Android + web client IDs).
 GOOGLE_CLIENT_IDS = _list("GOOGLE_CLIENT_IDS")
 FREE_CREDITS = _int("FREE_CREDITS", 10)  # given once to each new app account
 MAX_PENDING_JOBS = _int("MAX_PENDING_JOBS", 5)  # per app user
 SESSION_DAYS = _int("SESSION_DAYS", 30)
+
+APIFY_TOKENS = _list("APIFY_TOKENS") or ([APIFY_TOKEN] if APIFY_TOKEN else [])
 
 # --- Fetch ---
 APIFY_ACTOR = os.getenv("APIFY_ACTOR", "apify~instagram-scraper")
@@ -81,13 +89,25 @@ CHAT_HISTORY_TURNS = _int("CHAT_HISTORY_TURNS", 4)
 PROMPT_CHAR_BUDGET = _int("PROMPT_CHAR_BUDGET", 14000)
 SEARCH_TOP_K = _int("SEARCH_TOP_K", 3)
 
+# --- Concurrency limits (per process) ---
+GEMINI_CONCURRENCY = _int("GEMINI_CONCURRENCY", 8)
+GROQ_CONCURRENCY = _int("GROQ_CONCURRENCY", 8)
+APIFY_CONCURRENCY = _int("APIFY_CONCURRENCY", 5)
+# Videos are held in memory while being sent to the AI; this caps RAM use.
+ANALYZE_CONCURRENCY = _int("ANALYZE_CONCURRENCY", 4)
+
 # --- Worker / job queue ---
+# all: web + worker in one process (default, simplest). For scale, run one or more
+# ROLE=web services (Telegram webhook + API) and ROLE=worker services (analysis).
+ROLE = _str("ROLE", "all").lower()
 WORKER_CONCURRENCY = _int("WORKER_CONCURRENCY", 2)
 JOB_MAX_ATTEMPTS = _int("JOB_MAX_ATTEMPTS", 3)  # crashes/redeploys before a job is marked failed
 JOB_LOCK_TIMEOUT = _int("JOB_LOCK_TIMEOUT", 180)  # s without a heartbeat before a job is taken over
 JOB_HEARTBEAT = _int("JOB_HEARTBEAT", 30)
 # Idle re-check of the queue. Long, so Neon can scale to zero while nothing happens.
 QUEUE_IDLE_POLL = _int("QUEUE_IDLE_POLL", 600)
+# Used instead when job notifications can't be received (e.g. only a pooled URL works).
+QUEUE_FALLBACK_POLL = _int("QUEUE_FALLBACK_POLL", 5)
 
 
 REQUIRED = [
@@ -97,5 +117,7 @@ REQUIRED = [
 
 
 def missing_required() -> list[str]:
-    """Names (never values) of required settings that are unset or empty."""
-    return [name for name in REQUIRED if not _str(name)]
+    """Names (never values) of required settings that are unset or empty.
+    A key list (e.g. GEMINI_API_KEYS) counts for its singular name."""
+    plural = {"GEMINI_API_KEY": "GEMINI_API_KEYS", "GROQ_API_KEY": "GROQ_API_KEYS", "APIFY_TOKEN": "APIFY_TOKENS"}
+    return [name for name in REQUIRED if not (_str(name) or _str(plural.get(name, "")))]

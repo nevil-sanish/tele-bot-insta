@@ -34,6 +34,14 @@ CREATE TABLE IF NOT EXISTS reels (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Full-text search over each reel (used by /ask), kept up to date by Postgres.
+ALTER TABLE reels ADD COLUMN IF NOT EXISTS search tsvector GENERATED ALWAYS AS (
+    to_tsvector('english',
+        title || ' ' || summary || ' ' || category || ' ' || author || ' ' ||
+        key_ideas::text || ' ' || tools::text || ' ' || tags::text || ' ' || hashtags::text)
+) STORED;
+CREATE INDEX IF NOT EXISTS reels_search ON reels USING GIN (search);
+
 -- Each user's library: which reels they saved.
 CREATE TABLE IF NOT EXISTS user_reels (
     user_id   BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -61,7 +69,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 0;  -- higher runs first
 CREATE INDEX IF NOT EXISTS jobs_pending ON jobs (status, id) WHERE status IN ('queued', 'running');
+-- At most one running job per reel, even with many worker machines.
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_running_per_reel ON jobs (shortcode) WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS jobs_user ON jobs (user_id, id DESC);
 
 -- Every credit change, for support and auditing.
@@ -72,4 +83,26 @@ CREATE TABLE IF NOT EXISTS credit_ledger (
     reason     TEXT NOT NULL,
     job_id     BIGINT REFERENCES jobs(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Calls per API key per day (key_id is a short hash, never the key).
+CREATE TABLE IF NOT EXISTS api_usage (
+    day           DATE NOT NULL DEFAULT CURRENT_DATE,
+    provider      TEXT NOT NULL,
+    key_id        TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    requests      INTEGER NOT NULL DEFAULT 0,
+    errors        INTEGER NOT NULL DEFAULT 0,
+    input_tokens  BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, provider, key_id, model)
+);
+
+-- Telegram conversation state, so any instance can answer follow-up questions.
+CREATE TABLE IF NOT EXISTS chat_state (
+    chat_id          BIGINT PRIMARY KEY,
+    active_shortcode TEXT REFERENCES reels(shortcode) ON DELETE SET NULL,
+    history          JSONB NOT NULL DEFAULT '[]',
+    pending_link     TEXT,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );

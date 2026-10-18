@@ -57,7 +57,8 @@ async def test_full_pipeline_saves_reel_and_deletes_video(pg, monkeypatch, tmp_p
     saved = await pg.get_reel("SC123")
     assert saved.author == "bob" and saved.model == "gemini-3.5-flash" and saved.link == URL
     assert (await pg.get_job(job.id)).status == "done"
-    assert chat.state(7).active.shortcode == "SC123"
+    active, _, _ = await pg.get_chat(7)
+    assert active.shortcode == "SC123"
 
 
 async def test_second_request_uses_the_cache(pg, monkeypatch, tmp_path):
@@ -82,7 +83,7 @@ async def test_fetch_failure_fails_job_and_asks_for_forward(pg, monkeypatch):
     job = await _job(pg)
     await worker.process(bot, job)
     assert "Forward me the video" in bot.edits[-1]
-    assert chat.state(7).pending_link == URL
+    assert await chat.pop_pending(7) == URL
     failed = await pg.get_job(job.id)
     assert failed.status == "failed" and "apify: 403" in failed.error
 
@@ -150,3 +151,35 @@ def test_shortcode_for_links_and_forwards():
 
 def test_config_defaults_sane():
     assert config.JOB_LOCK_TIMEOUT > config.JOB_HEARTBEAT * 2
+
+
+async def test_worker_is_woken_by_postgres_notify(pg, monkeypatch, tmp_path):
+    """A worker in another process learns about new jobs only through NOTIFY."""
+    from tests.conftest import TEST_DATABASE_URL
+
+    _fake_pipeline(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "DATABASE_LISTEN_URL", TEST_DATABASE_URL)
+    monkeypatch.setattr(config, "QUEUE_IDLE_POLL", 3600)  # no polling to fall back on
+    w = worker.Worker(FakeBot())
+    w.start(1)
+    await asyncio.sleep(0.5)  # listener connected, loop idle
+    user = await pg.telegram_user(11)
+    job = await pg.enqueue(user.id, "SC123", url=URL, chat_id=11, status_message_id=5)  # not via w.submit
+    for _ in range(60):
+        if (await pg.get_job(job.id)).status == "done":
+            break
+        await asyncio.sleep(0.1)
+    await w.stop()
+    assert (await pg.get_job(job.id)).status == "done"
+
+
+async def test_listener_failure_falls_back_to_polling(pg, monkeypatch):
+    monkeypatch.setattr(config, "DATABASE_LISTEN_URL", "postgresql://nobody@127.0.0.1:1/none")
+    w = worker.Worker(FakeBot())
+    w.start(1)
+    for _ in range(50):
+        if w.idle_poll == config.QUEUE_FALLBACK_POLL:
+            break
+        await asyncio.sleep(0.1)
+    await w.stop()
+    assert w.idle_poll == config.QUEUE_FALLBACK_POLL

@@ -108,7 +108,7 @@ async def analyze_reel(body: ReelRequest, request: Request, user: CurrentUser) -
     if not user.unlimited and user.credits - pending < 1:
         raise HTTPException(402, "Out of credits")
 
-    reel, job = await request.app.state.worker.submit(user.id, shortcode, url=url)
+    reel, job = await request.app.state.worker.submit(user.id, shortcode, url=url, priority=user.priority)
     if reel:  # analyzed by someone else a moment ago
         return {"status": "done", "credits_used": 0, "reel": reel.to_dict()}
     return {"status": "queued", "job_id": job.id}

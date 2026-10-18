@@ -57,9 +57,10 @@ async def test_thinking_fallback_is_remembered_per_model(monkeypatch):
         return SimpleNamespace(text='{"title": "t"}', usage_metadata=None)
 
     client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=fake_generate)))
-    monkeypatch.setattr(analyze, "_gemini", lambda: client)
+    monkeypatch.setattr(analyze, "_gemini", lambda key: client)
     analyze._thinking_ok.clear()
-    await analyze._gemini_call("m", [], "cap")
+    key = analyze.keys.Key("k", "id")
+    await analyze._gemini_call(key, "m", [], "cap")
     assert len(calls) == 2  # MINIMAL rejected, LOW worked
-    await analyze._gemini_call("m", [], "cap")
+    await analyze._gemini_call(key, "m", [], "cap")
     assert len(calls) == 3  # second reel goes straight to LOW

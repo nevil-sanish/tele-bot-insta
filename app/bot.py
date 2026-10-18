@@ -75,10 +75,10 @@ async def _submit(
     status = await msg.reply_text("⏳ Processing…")
     reel, _ = await _worker(context).submit(
         user.id, shortcode_for(url, file_unique_id), url=url, file_id=file_id, mime_type=mime_type,
-        chat_id=msg.chat_id, status_message_id=status.message_id,
+        chat_id=msg.chat_id, status_message_id=status.message_id, priority=user.priority,
     )
     if reel:
-        chat.set_active(msg.chat_id, reel)
+        await chat.set_active(msg.chat_id, reel)
         await show_result(context.bot, msg.chat_id, status.message_id, reel, cached=True)
 
 
@@ -107,9 +107,7 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Link source, in order: the video's own caption, then a link we failed to fetch earlier.
-    st = chat.state(msg.chat_id)
-    url = cap.find_ig_url(msg.caption) or st.pending_link
-    st.pending_link = None
+    url = cap.find_ig_url(msg.caption) or await chat.pop_pending(msg.chat_id)
     await _submit(
         update, context, url=url, file_id=media.file_id, file_unique_id=media.file_unique_id, mime_type=mime
     )
@@ -118,9 +116,7 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     photo = msg.photo[-1]  # largest size
-    st = chat.state(msg.chat_id)
-    url = cap.find_ig_url(msg.caption) or st.pending_link
-    st.pending_link = None
+    url = cap.find_ig_url(msg.caption) or await chat.pop_pending(msg.chat_id)
     await _submit(
         update, context, url=url, file_id=photo.file_id, file_unique_id=photo.file_unique_id,
         mime_type="image/jpeg",
@@ -147,7 +143,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.chat.send_action(ChatAction.TYPING)
     try:
         user = await _user(update, context)
-        answer, hits = await chat.ask_library(question, only=await db.library_shortcodes(user.id))
+        answer, hits = await chat.ask_library(question, user.id)
     except Exception as e:
         log.warning("/ask failed: %s", e)
         await msg.reply_text("⚠️ Chat is unavailable right now (Groq error). Try again in a minute.")
@@ -199,7 +195,7 @@ async def retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat.reset(update.effective_message.chat_id)
+    await chat.reset(update.effective_message.chat_id)
     await update.effective_message.reply_text("🧹 Cleared. Send a new reel link to start again.")
 
 

@@ -19,7 +19,6 @@ from fetchers.base import FetchError, FetchResult, MediaFile, new_tmp_path
 from services import analyze, caption as cap, chat, db
 from services.db import Job
 from services.models import Reel
-from services.search import index
 
 log = logging.getLogger(__name__)
 
@@ -29,19 +28,46 @@ def shortcode_for(url: str | None, file_unique_id: str | None = None) -> str | N
 
 
 class Worker:
+    """Runs `n` concurrent job loops. Any number of Worker processes can share the
+    queue; enqueues anywhere wake them through Postgres NOTIFY."""
+
     def __init__(self, bot: Bot | None) -> None:
         self.bot = bot
         self._wake = asyncio.Event()
         self._claim_lock = asyncio.Lock()
         self._tasks: list[asyncio.Task] = []
+        self.idle_poll = config.QUEUE_IDLE_POLL
 
-    def start(self, n: int = config.WORKER_CONCURRENCY) -> None:
+    def start(self, n: int = config.WORKER_CONCURRENCY, listen: bool = True) -> None:
         self._tasks = [asyncio.create_task(self._loop()) for _ in range(n)]
+        if listen:
+            self._tasks.append(asyncio.create_task(self._listen()))
 
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def _listen(self) -> None:
+        """Keep a LISTEN connection open; if that's impossible, poll the queue often."""
+        while True:
+            con = None
+            try:
+                con = await db.listen_for_jobs(self.wake)
+                self.idle_poll = config.QUEUE_IDLE_POLL
+                self.wake()  # catch up on anything enqueued while we weren't listening
+                while not con.is_closed():
+                    await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("job notifications unavailable (%s); polling every %ss", e, config.QUEUE_FALLBACK_POLL)
+                self.idle_poll = config.QUEUE_FALLBACK_POLL
+                self.wake()
+            finally:
+                if con is not None and not con.is_closed():
+                    await con.close()
+            await asyncio.sleep(30)  # then try to reconnect
 
     def wake(self) -> None:
         self._wake.set()
@@ -69,7 +95,7 @@ class Worker:
                 continue
             if job is None:
                 try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=config.QUEUE_IDLE_POLL)
+                    await asyncio.wait_for(self._wake.wait(), timeout=self.idle_poll)
                 except asyncio.TimeoutError:
                     pass
                 continue
@@ -119,7 +145,7 @@ async def process(bot: Bot | None, job: Job) -> None:
         log.warning("all fetchers failed for %s: %s", job.shortcode, e)
         await db.fail_job(job.id, f"fetch: {e}")
         if job.chat_id:
-            chat.state(job.chat_id).pending_link = job.url
+            await chat.set_pending(job.chat_id, job.url)
         await _status(
             bot, job,
             "😕 Couldn't fetch this reel. Forward me the video (or save it and send it here, "
@@ -154,7 +180,6 @@ async def process(bot: Bot | None, job: Job) -> None:
     reel = build_reel(job, fetched, caption_text, result)
     await _status(bot, job, "💾 Saving…")
     await db.finish_job(job, reel, analyzed=True)
-    index.add(reel)
     await _show(bot, job, reel)
     if job.chat_id and not job.url:
         await bot.send_message(
@@ -241,7 +266,7 @@ def _buttons(reel: Reel):
 
 async def _show(bot: Bot | None, job: Job, reel: Reel, cached: bool = False) -> None:
     if job.chat_id and bot:
-        chat.set_active(job.chat_id, reel)
+        await chat.set_active(job.chat_id, reel)
         await show_result(bot, job.chat_id, job.status_message_id, reel, cached)
 
 

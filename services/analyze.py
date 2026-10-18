@@ -16,6 +16,8 @@ from pydantic import BaseModel
 from app import config
 from fetchers.base import MediaFile, new_tmp_path
 
+from . import keys
+
 log = logging.getLogger(__name__)
 
 
@@ -77,16 +79,15 @@ def _prompt(caption: str | None) -> str:
 
 # ---------------------------------------------------------------- Gemini
 
-_gemini_client = None
+_gemini_clients: dict[str, object] = {}  # key id -> genai.Client
 
 
-def _gemini():
-    global _gemini_client
-    if _gemini_client is None:
+def _gemini(key: keys.Key):
+    if key.id not in _gemini_clients:
         from google import genai
 
-        _gemini_client = genai.Client(api_key=config.GEMINI_API_KEY)
-    return _gemini_client
+        _gemini_clients[key.id] = genai.Client(api_key=key.value)
+    return _gemini_clients[key.id]
 
 
 def _thinking_options():
@@ -106,25 +107,32 @@ def _thinking_options():
 _thinking_ok: dict[str, int] = {}
 
 
-async def _media_parts(media: list[MediaFile], uploaded: list):
-    """Build Gemini parts. Inline if the request stays under ~20 MB, else Files API."""
+def _video_meta():
     from google.genai import types
 
-    client = _gemini()
-    total = sum(m.path.stat().st_size for m in media)
-    inline = total <= config.INLINE_LIMIT_MB * 1024 * 1024
-    video_meta = types.VideoMetadata(
-        fps=config.VIDEO_FPS, start_offset="0s", end_offset=f"{config.VIDEO_MAX_SECONDS}s"
-    )
+    return types.VideoMetadata(fps=config.VIDEO_FPS, start_offset="0s", end_offset=f"{config.VIDEO_MAX_SECONDS}s")
+
+
+async def _inline_parts(media: list[MediaFile]) -> list:
+    """Media sent inside the request. Works with any key."""
+    from google.genai import types
+
     parts = []
     for m in media:
-        meta = video_meta if m.is_video else None
-        if inline:
-            blob = types.Blob(data=await asyncio.to_thread(m.path.read_bytes), mime_type=m.mime_type)
-            parts.append(types.Part(inline_data=blob, video_metadata=meta))
-            continue
+        blob = types.Blob(data=await asyncio.to_thread(m.path.read_bytes), mime_type=m.mime_type)
+        parts.append(types.Part(inline_data=blob, video_metadata=_video_meta() if m.is_video else None))
+    return parts
+
+
+async def _uploaded_parts(key: keys.Key, media: list[MediaFile], uploaded: list) -> list:
+    """Files API upload for large media. Uploads belong to one key's project."""
+    from google.genai import types
+
+    client = _gemini(key)
+    parts = []
+    for m in media:
         f = await client.aio.files.upload(file=str(m.path), config={"mime_type": m.mime_type})
-        uploaded.append(f)
+        uploaded.append((key, f))
         for _ in range(60):  # videos need a few seconds of server-side processing
             if f.state is None or f.state.name != "PROCESSING":
                 break
@@ -132,9 +140,10 @@ async def _media_parts(media: list[MediaFile], uploaded: list):
             f = await client.aio.files.get(name=f.name)
         if f.state is not None and f.state.name == "FAILED":
             raise AnalysisError("Gemini Files API could not process the video")
-        parts.append(
-            types.Part(file_data=types.FileData(file_uri=f.uri, mime_type=m.mime_type), video_metadata=meta)
-        )
+        parts.append(types.Part(
+            file_data=types.FileData(file_uri=f.uri, mime_type=m.mime_type),
+            video_metadata=_video_meta() if m.is_video else None,
+        ))
     return parts
 
 
@@ -142,7 +151,7 @@ def _is_bad_request(e: Exception) -> bool:
     return getattr(e, "code", None) == 400
 
 
-async def _gemini_call(model: str, parts: list, caption: str | None) -> AnalysisResult:
+async def _gemini_call(key: keys.Key, model: str, parts: list, caption: str | None) -> AnalysisResult:
     from google.genai import types
 
     contents = [types.Content(role="user", parts=[*parts, types.Part(text=_prompt(caption))])]
@@ -160,7 +169,7 @@ async def _gemini_call(model: str, parts: list, caption: str | None) -> Analysis
         )
         try:
             resp = await asyncio.wait_for(
-                _gemini().aio.models.generate_content(model=model, contents=contents, config=cfg),
+                _gemini(key).aio.models.generate_content(model=model, contents=contents, config=cfg),
                 timeout=config.GEMINI_TIMEOUT,
             )
         except Exception as e:
@@ -182,41 +191,91 @@ async def _gemini_call(model: str, parts: list, caption: str | None) -> Analysis
 
 
 async def _analyze_gemini(media: list[MediaFile], caption: str | None) -> AnalysisResult:
-    if not config.GEMINI_API_KEY:
-        raise AnalysisError("GEMINI_API_KEY not set")
+    """Best model first; within a model, rotate keys past rate limits. Other errors
+    (overload, timeout, bad output) move on to the next model."""
+    pool = keys.gemini
+    if not pool:
+        raise AnalysisError("no Gemini API key configured")
+    total = sum(m.path.stat().st_size for m in media)
+    inline = await _inline_parts(media) if total <= config.INLINE_LIMIT_MB * 1024 * 1024 else None
     uploaded: list = []
+    errors = []
     try:
-        parts = await _media_parts(media, uploaded)
-        errors = []
         for model in config.GEMINI_MODELS:
-            try:
-                result = await _gemini_call(model, parts, caption)
-                log.info("analysis ok: model=%s usage=%s", model, result.usage)
+            candidates = pool.candidates(model)
+            if not candidates:
+                errors.append(f"{model}: every key is rate-limited")
+                continue
+            for key in candidates:
+                try:
+                    parts = inline if inline is not None else await _uploaded_parts(key, media, uploaded)
+                    async with pool.slot():
+                        pool.used(key)
+                        result = await _gemini_call(key, model, parts, caption)
+                except Exception as e:
+                    await keys.record("gemini", key, model, ok=False)
+                    errors.append(f"{model}/{key.id}: {_short(e)}")
+                    log.warning("gemini failed: %s", errors[-1])
+                    rest = keys.rest_seconds(e)
+                    if rest:
+                        pool.rest(key, model, rest)
+                        continue  # same model, next key
+                    break  # not a quota problem: next model
+                log.info("analysis ok: model=%s key=%s usage=%s", model, key.id, result.usage)
+                await keys.record(
+                    "gemini", key, model, ok=True,
+                    input_tokens=result.usage.get("input") or 0, output_tokens=result.usage.get("output") or 0,
+                )
                 return result
-            except Exception as e:  # 429 quota, 5xx, timeouts: try the next model
-                errors.append(f"{model}: {_short(e)}")
-                log.warning("gemini failed: %s", errors[-1])
         raise AnalysisError("; ".join(errors))
     finally:
-        for f in uploaded:
+        for key, f in uploaded:
             try:
-                await _gemini().aio.files.delete(name=f.name)
+                await _gemini(key).aio.files.delete(name=f.name)
             except Exception:
                 pass
 
 
 # ---------------------------------------------------------------- Groq backup
 
-_groq_client = None
+_groq_clients: dict[str, object] = {}  # key id -> AsyncGroq
 
 
-def groq_client():
-    global _groq_client
-    if _groq_client is None:
+def groq_client(key: keys.Key):
+    if key.id not in _groq_clients:
         from groq import AsyncGroq
 
-        _groq_client = AsyncGroq(api_key=config.GROQ_API_KEY)
-    return _groq_client
+        _groq_clients[key.id] = AsyncGroq(api_key=key.value)
+    return _groq_clients[key.id]
+
+
+async def groq_call(model: str, call):
+    """Run `call(client)` with the least-used Groq key that isn't resting for this
+    model, rotating past rate limits. Other errors are raised."""
+    pool = keys.groq
+    if not pool:
+        raise AnalysisError("no Groq API key configured")
+    last = None
+    for key in pool.candidates(model):
+        try:
+            async with pool.slot():
+                pool.used(key)
+                result = await call(groq_client(key))
+        except Exception as e:
+            await keys.record("groq", key, model, ok=False)
+            rest = keys.rest_seconds(e)
+            if not rest:
+                raise
+            pool.rest(key, model, rest)
+            last = e
+            continue
+        usage = getattr(result, "usage", None)
+        await keys.record(
+            "groq", key, model, ok=True,
+            input_tokens=getattr(usage, "prompt_tokens", 0) or 0, output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        )
+        return result
+    raise AnalysisError(f"every Groq key is rate-limited for {model}: {_short(last) if last else 'no keys'}")
 
 
 async def extract_audio(video: MediaFile) -> MediaFile | None:
@@ -237,13 +296,12 @@ async def extract_audio(video: MediaFile) -> MediaFile | None:
 
 
 async def transcribe(audio: MediaFile) -> str:
-    with audio.path.open("rb") as f:
-        data = f.read()
-    resp = await groq_client().audio.transcriptions.create(
+    data = await asyncio.to_thread(audio.path.read_bytes)
+    resp = await groq_call(config.GROQ_WHISPER_MODEL, lambda c: c.audio.transcriptions.create(
         model=config.GROQ_WHISPER_MODEL,
         file=(audio.path.name, data),
         response_format="text",
-    )
+    ))
     return (resp if isinstance(resp, str) else getattr(resp, "text", "")).strip()
 
 
@@ -252,14 +310,14 @@ async def groq_json(system: str, user: str, max_tokens: int = 1500) -> dict:
     errors = []
     for model in config.GROQ_CHAT_MODELS:
         try:
-            resp = await groq_client().chat.completions.create(
+            resp = await groq_call(model, lambda c, model=model: c.chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                 response_format={"type": "json_object"},
                 reasoning_effort="low",
                 max_completion_tokens=max_tokens,
                 temperature=0.2,
-            )
+            ))
             return json.loads(resp.choices[0].message.content or "{}")
         except Exception as e:
             errors.append(f"{model}: {_short(e)}")
@@ -268,8 +326,8 @@ async def groq_json(system: str, user: str, max_tokens: int = 1500) -> dict:
 
 
 async def _analyze_groq(media: list[MediaFile], caption: str | None) -> AnalysisResult:
-    if not config.GROQ_API_KEY:
-        raise AnalysisError("GROQ_API_KEY not set")
+    if not keys.groq:
+        raise AnalysisError("no Groq API key configured")
     transcript = ""
     video = next((m for m in media if m.is_video), None)
     if video:
@@ -297,16 +355,27 @@ async def _analyze_groq(media: list[MediaFile], caption: str | None) -> Analysis
 # ---------------------------------------------------------------- entry point
 
 
+_analyze_slots: asyncio.Semaphore | None = None
+
+
+def _slots() -> asyncio.Semaphore:
+    global _analyze_slots
+    if _analyze_slots is None:
+        _analyze_slots = asyncio.Semaphore(max(1, config.ANALYZE_CONCURRENCY))
+    return _analyze_slots
+
+
 async def analyze(media: list[MediaFile], caption: str | None) -> AnalysisResult:
     errors = []
-    try:
-        return await _analyze_gemini(media, caption)
-    except Exception as e:
-        errors.append(f"gemini: {_short(e)}")
-    try:
-        return await _analyze_groq(media, caption)
-    except Exception as e:
-        errors.append(f"groq: {_short(e)}")
+    async with _slots():  # caps how many videos sit in memory at once
+        try:
+            return await _analyze_gemini(media, caption)
+        except Exception as e:
+            errors.append(f"gemini: {_short(e)}")
+        try:
+            return await _analyze_groq(media, caption)
+        except Exception as e:
+            errors.append(f"groq: {_short(e)}")
     raise AnalysisError(" | ".join(errors))
 
 

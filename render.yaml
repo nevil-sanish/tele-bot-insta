@@ -25,3 +25,17 @@ services:
         sync: false
       - key: COBALT_URL
         sync: false
+
+# Scaling out (paid; Render has no free background workers): set ROLE=web on the
+# service above and add workers from the same image, e.g.
+#
+#  - type: worker
+#    name: reel-brain-worker
+#    runtime: docker
+#    plan: standard
+#    envVars:
+#      - key: ROLE
+#        value: worker
+#      - key: WORKER_CONCURRENCY
+#        value: "12"
+#      - fromGroup: reel-brain-secrets   # same keys as the web service

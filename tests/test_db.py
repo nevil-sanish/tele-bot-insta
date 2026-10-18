@@ -106,3 +106,31 @@ async def test_failed_jobs_and_retry(pg):
     again = await pg.get_job(a.id)
     assert again.status == "queued" and again.chat_id == 9 and again.error is None
     assert await pg.failed_jobs(user.id) == []
+
+
+async def test_higher_priority_jobs_run_first(pg):
+    user = await pg.telegram_user(777)
+    low = await pg.enqueue(user.id, "LOW", url="u", priority=0)
+    high = await pg.enqueue(user.id, "HIGH", url="u", priority=10)
+    assert (await pg.claim_job()).id == high.id
+    assert (await pg.claim_job()).id == low.id
+
+
+async def test_database_blocks_two_running_jobs_for_one_reel(pg):
+    import asyncpg
+    import pytest
+
+    user = await pg.telegram_user(888)
+    a = await pg.enqueue(user.id, "DUP", url="u")
+    b = await pg.enqueue(user.id, "DUP", url="u")
+    await pg.claim_job()
+    with pytest.raises(asyncpg.UniqueViolationError):  # what a racing second machine would hit
+        await pg.pool().execute("UPDATE jobs SET status = 'running' WHERE id = $1", b.id)
+    assert (await pg.get_job(a.id)).status == "running"
+
+
+async def test_usage_is_counted_per_key_and_day(pg):
+    await pg.record_usage("gemini", "abc", "m", True, 100, 20)
+    await pg.record_usage("gemini", "abc", "m", False, 0, 0)
+    row = await pg.pool().fetchrow("SELECT * FROM api_usage WHERE key_id = 'abc'")
+    assert (row["requests"], row["errors"], row["input_tokens"], row["output_tokens"]) == (2, 1, 100, 20)

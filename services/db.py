@@ -3,6 +3,7 @@ queue and credits. Plain SQL over asyncpg; no ORM."""
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -17,6 +18,8 @@ log = logging.getLogger(__name__)
 
 SCHEMA = Path(__file__).with_name("schema.sql")
 UNLIMITED = "unlimited"
+JOBS_CHANNEL = "reel_jobs"  # NOTIFY channel that wakes workers
+PRIORITY = {"premium": 10, UNLIMITED: 5, "free": 0}  # higher plans are served first
 
 _pool: asyncpg.Pool | None = None
 
@@ -71,6 +74,10 @@ class User:
     @property
     def unlimited(self) -> bool:
         return self.plan == UNLIMITED
+
+    @property
+    def priority(self) -> int:
+        return PRIORITY.get(self.plan, 0)
 
     def to_dict(self) -> dict:
         return {"id": self.id, "plan": self.plan, "credits": self.credits, "email": self.email, "name": self.name}
@@ -197,8 +204,70 @@ async def in_library(user_id: int, shortcode: str) -> bool:
     ))
 
 
-async def all_reels() -> list[Reel]:
-    return [_reel(r) for r in await pool().fetch("SELECT * FROM reels")]
+async def search_library(user_id: int, query: str, limit: int = 3) -> list[Reel]:
+    """Full-text search over one user's library, best matches first (any word may match)."""
+    terms = re.findall(r"\w+", (query or "").lower())[:12]
+    if not terms:
+        return []
+    rows = await pool().fetch(
+        """SELECT r.* FROM user_reels u JOIN reels r USING (shortcode),
+                  to_tsquery('english', $2) AS q
+           WHERE u.user_id = $1 AND r.search @@ q
+           ORDER BY ts_rank(r.search, q) DESC, u.saved_at DESC LIMIT $3""",
+        user_id, " | ".join(terms), limit,
+    )
+    return [_reel(r) for r in rows]
+
+
+# ---------------------------------------------------------------- chat state
+
+
+async def get_chat(chat_id: int) -> tuple[Reel | None, list[dict], str | None]:
+    """(active reel, recent Q&A history, link waiting for a forwarded video)."""
+    row = await pool().fetchrow("SELECT * FROM chat_state WHERE chat_id = $1", chat_id)
+    if not row:
+        return None, [], None
+    active = await get_reel(row["active_shortcode"]) if row["active_shortcode"] else None
+    return active, row["history"], row["pending_link"]
+
+
+async def set_active_reel(chat_id: int, shortcode: str) -> None:
+    await pool().execute(
+        """INSERT INTO chat_state (chat_id, active_shortcode) VALUES ($1, $2)
+           ON CONFLICT (chat_id) DO UPDATE SET active_shortcode = $2, history = '[]', updated_at = now()""",
+        chat_id, shortcode,
+    )
+
+
+async def save_history(chat_id: int, history: list[dict]) -> None:
+    await pool().execute(
+        """INSERT INTO chat_state (chat_id, history) VALUES ($1, $2)
+           ON CONFLICT (chat_id) DO UPDATE SET history = $2, updated_at = now()""",
+        chat_id, history,
+    )
+
+
+async def set_pending_link(chat_id: int, link: str | None) -> None:
+    await pool().execute(
+        """INSERT INTO chat_state (chat_id, pending_link) VALUES ($1, $2)
+           ON CONFLICT (chat_id) DO UPDATE SET pending_link = $2, updated_at = now()""",
+        chat_id, link,
+    )
+
+
+async def pop_pending_link(chat_id: int) -> str | None:
+    """Take the waiting link (if any) and clear it, atomically."""
+    return await pool().fetchval(
+        """WITH old AS (SELECT pending_link FROM chat_state WHERE chat_id = $1 FOR UPDATE)
+           UPDATE chat_state c SET pending_link = NULL, updated_at = now() FROM old
+           WHERE c.chat_id = $1 AND old.pending_link IS NOT NULL
+           RETURNING old.pending_link""",
+        chat_id,
+    )
+
+
+async def reset_chat(chat_id: int) -> None:
+    await pool().execute("DELETE FROM chat_state WHERE chat_id = $1", chat_id)
 
 
 # ---------------------------------------------------------------- job queue
@@ -232,43 +301,59 @@ def _job(row) -> Job | None:
 async def enqueue(
     user_id: int, shortcode: str, url: str | None = None, file_id: str | None = None,
     mime_type: str = "video/mp4", chat_id: int | None = None, status_message_id: int | None = None,
+    priority: int = 0,
 ) -> Job:
-    row = await pool().fetchrow(
-        """INSERT INTO jobs (user_id, shortcode, url, file_id, mime_type, chat_id, status_message_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *""",
-        user_id, shortcode, url, file_id, mime_type, chat_id, status_message_id,
-    )
+    async with pool().acquire() as con, con.transaction():
+        row = await con.fetchrow(
+            """INSERT INTO jobs (user_id, shortcode, url, file_id, mime_type, chat_id, status_message_id, priority)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *""",
+            user_id, shortcode, url, file_id, mime_type, chat_id, status_message_id, priority,
+        )
+        await con.execute(f"NOTIFY {JOBS_CHANNEL}")  # delivered to workers on commit
     return _job(row)
 
 
 async def claim_job() -> Job | None:
-    """Take the oldest runnable job. A running job whose heartbeat stopped (crash,
-    redeploy) is taken over. Jobs for a reel that is already being analyzed wait,
-    so the same reel is never analyzed twice at once."""
+    """Take the next runnable job: highest priority, then oldest. A running job whose
+    heartbeat stopped (crash, redeploy) is taken over. Jobs for a reel that already
+    has a running job wait, so one reel is never analyzed twice at once; the unique
+    index enforces that across machines too (a lost race just returns None)."""
     stale = timedelta(seconds=config.JOB_LOCK_TIMEOUT)
-    async with pool().acquire() as con, con.transaction():
-        await con.execute(
-            """UPDATE jobs SET status = 'failed', error = COALESCE(error, 'gave up after repeated crashes'),
-                   updated_at = now()
-               WHERE status = 'running' AND locked_at < now() - $1::interval AND attempts >= $2""",
-            stale, config.JOB_MAX_ATTEMPTS,
-        )
-        row = await con.fetchrow(
-            """UPDATE jobs SET status = 'running', locked_at = now(), attempts = attempts + 1, updated_at = now()
-               WHERE id = (
-                   SELECT j.id FROM jobs j
-                   WHERE (j.status = 'queued' OR (j.status = 'running' AND j.locked_at < now() - $1::interval))
-                     AND NOT EXISTS (
-                         SELECT 1 FROM jobs r
-                         WHERE r.shortcode = j.shortcode AND r.id <> j.id AND r.status = 'running'
-                           AND r.locked_at >= now() - $1::interval)
-                   ORDER BY j.id
-                   FOR UPDATE SKIP LOCKED
-                   LIMIT 1)
-               RETURNING *""",
-            stale,
-        )
-        return _job(row)
+    try:
+        async with pool().acquire() as con, con.transaction():
+            await con.execute(
+                """UPDATE jobs SET status = 'failed', error = COALESCE(error, 'gave up after repeated crashes'),
+                       updated_at = now()
+                   WHERE status = 'running' AND locked_at < now() - $1::interval AND attempts >= $2""",
+                stale, config.JOB_MAX_ATTEMPTS,
+            )
+            row = await con.fetchrow(
+                """UPDATE jobs SET status = 'running', locked_at = now(), attempts = attempts + 1, updated_at = now()
+                   WHERE id = (
+                       SELECT j.id FROM jobs j
+                       WHERE (j.status = 'queued' OR (j.status = 'running' AND j.locked_at < now() - $1::interval))
+                         AND NOT EXISTS (
+                             SELECT 1 FROM jobs r
+                             WHERE r.shortcode = j.shortcode AND r.id <> j.id AND r.status = 'running')
+                       ORDER BY j.priority DESC, j.id
+                       FOR UPDATE SKIP LOCKED
+                       LIMIT 1)
+                   RETURNING *""",
+                stale,
+            )
+            return _job(row)
+    except asyncpg.UniqueViolationError:
+        return None  # another machine claimed this reel a moment ago
+
+
+async def listen_for_jobs(on_job, dsn: str | None = None) -> asyncpg.Connection:
+    """Dedicated connection that calls on_job() whenever a job is enqueued anywhere.
+    Needs a direct (non-pooled) connection; Neon's direct host is the pooled one
+    without '-pooler'."""
+    dsn = dsn or config.DATABASE_LISTEN_URL or config.DATABASE_URL.replace("-pooler.", ".")
+    con = await asyncpg.connect(dsn)
+    await con.add_listener(JOBS_CHANNEL, lambda *_: on_job())
+    return con
 
 
 async def heartbeat(job_id: int) -> None:
@@ -353,3 +438,18 @@ async def retry_job(job_id: int, chat_id: int | None = None, status_message_id: 
 
 async def queue_size() -> int:
     return await pool().fetchval("SELECT count(*) FROM jobs WHERE status IN ('queued', 'running')")
+
+
+# ---------------------------------------------------------------- API usage
+
+
+async def record_usage(provider: str, key_id: str, model: str, ok: bool, input_tokens: int, output_tokens: int) -> None:
+    await pool().execute(
+        """INSERT INTO api_usage (provider, key_id, model, requests, errors, input_tokens, output_tokens)
+           VALUES ($1, $2, $3, 1, $4, $5, $6)
+           ON CONFLICT (day, provider, key_id, model) DO UPDATE SET
+               requests = api_usage.requests + 1, errors = api_usage.errors + EXCLUDED.errors,
+               input_tokens = api_usage.input_tokens + EXCLUDED.input_tokens,
+               output_tokens = api_usage.output_tokens + EXCLUDED.output_tokens""",
+        provider, key_id, model, 0 if ok else 1, input_tokens, output_tokens,
+    )

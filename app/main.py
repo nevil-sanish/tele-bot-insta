@@ -1,6 +1,5 @@
 """FastAPI entry point: /webhook (Telegram), /api (Android app) and /health."""
 
-import asyncio
 import hmac
 import logging
 from collections import deque
@@ -14,7 +13,6 @@ from app.api import router as api_router
 from app.bot import build_application
 from app.worker import Worker
 from services import db
-from services.search import index
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -33,26 +31,16 @@ application = build_application()
 _seen_updates: deque[int] = deque(maxlen=500)
 
 
-async def load_index() -> None:
-    """Rebuild the in-memory BM25 index from Postgres (runs after every restart)."""
-    try:
-        reels = await db.all_reels()
-        index.load(reels)
-        log.info("search index loaded: %d reels", len(reels))
-    except Exception as e:
-        log.warning("could not load search index: %s", e)
-
-
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     await db.connect()  # also applies the schema
     await application.initialize()
     await application.start()
-    worker = Worker(application.bot)
+    worker = Worker(application.bot)  # in ROLE=web it only enqueues; worker services process
     application.bot_data["worker"] = worker
     fastapi_app.state.worker = worker
-    worker.start()  # picks up jobs left over from before a restart
-    index_task = asyncio.create_task(load_index())
+    if config.ROLE == "all":
+        worker.start()  # picks up jobs left over from before a restart
     if config.PUBLIC_URL:
         await application.bot.set_webhook(
             url=f"{config.PUBLIC_URL.rstrip('/')}/webhook",
@@ -63,7 +51,6 @@ async def lifespan(fastapi_app: FastAPI):
     try:
         yield
     finally:
-        index_task.cancel()
         await worker.stop()  # running jobs are put back on the queue
         await application.stop()
         await application.shutdown()
@@ -78,7 +65,7 @@ app.include_router(api_router)
 @app.head("/health")
 async def health() -> dict:
     # No database query here, so pings don't keep Neon awake.
-    return {"ok": True, "library": len(index)}
+    return {"ok": True}
 
 
 @app.post("/webhook")

@@ -1,46 +1,39 @@
 """Q&A with Groq.
 
 - Plain text → question about the chat's active reel (reel JSON + last 4 turns).
-- /ask → BM25 top-3 summaries from the whole library.
-Prompts are trimmed to a fixed budget so they never grow past ~4K tokens.
+- /ask → full-text search over the user's library, top 3 → Groq.
+Conversation state lives in Postgres, so any instance can answer. Prompts are
+trimmed to a fixed budget so they never grow past ~4K tokens.
 """
 
 import json
 import logging
-from collections import deque
-from dataclasses import dataclass, field
 
 from app import config
 
-from .analyze import groq_client
+from . import db
+from .analyze import groq_call
 from .models import Reel
-from .search import index
 
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class ChatState:
-    active: Reel | None = None
-    history: deque = field(default_factory=lambda: deque(maxlen=config.CHAT_HISTORY_TURNS * 2))
-    pending_link: str | None = None  # link we couldn't fetch, waiting for a forwarded video
+async def set_active(chat_id: int, reel: Reel) -> None:
+    """The reel follow-up questions are about; starting a new reel clears the history."""
+    await db.set_active_reel(chat_id, reel.shortcode)
 
 
-_states: dict[int, ChatState] = {}
+async def set_pending(chat_id: int, link: str | None) -> None:
+    """Remember a link we couldn't fetch, so the next forwarded video is matched to it."""
+    await db.set_pending_link(chat_id, link)
 
 
-def state(chat_id: int) -> ChatState:
-    return _states.setdefault(chat_id, ChatState())
+async def pop_pending(chat_id: int) -> str | None:
+    return await db.pop_pending_link(chat_id)
 
 
-def set_active(chat_id: int, reel: Reel) -> None:
-    s = state(chat_id)
-    s.active = reel
-    s.history.clear()
-
-
-def reset(chat_id: int) -> None:
-    _states.pop(chat_id, None)
+async def reset(chat_id: int) -> None:
+    await db.reset_chat(chat_id)
 
 
 def reel_context(reel: Reel, budget: int) -> str:
@@ -65,13 +58,13 @@ async def complete(messages: list[dict], max_tokens: int = 700) -> str:
     last = None
     for model in config.GROQ_CHAT_MODELS:
         try:
-            resp = await groq_client().chat.completions.create(
+            resp = await groq_call(model, lambda c, model=model: c.chat.completions.create(
                 model=model,
                 messages=messages,
                 reasoning_effort="low",
                 max_completion_tokens=max_tokens,
                 temperature=0.3,
-            )
+            ))
             return (resp.choices[0].message.content or "").strip()
         except Exception as e:
             last = e
@@ -92,25 +85,24 @@ SYSTEM_LIBRARY = (
 
 
 async def ask_active(chat_id: int, question: str) -> str:
-    s = state(chat_id)
-    if not s.active:
+    active, history, _ = await db.get_chat(chat_id)
+    if not active:
         return "No active reel yet. Send me a reel link first, or use /ask to search your library."
-    history = list(s.history)
     history_chars = sum(len(m["content"]) for m in history)
     budget = max(2000, config.PROMPT_CHAR_BUDGET - history_chars - len(question) - len(SYSTEM_REEL))
     messages = [
-        {"role": "system", "content": f"{SYSTEM_REEL}\n\nReel data:\n{reel_context(s.active, budget)}"},
+        {"role": "system", "content": f"{SYSTEM_REEL}\n\nReel data:\n{reel_context(active, budget)}"},
         *history,
         {"role": "user", "content": question[:2000]},
     ]
     answer = await complete(messages)
-    s.history.append({"role": "user", "content": question[:1000]})
-    s.history.append({"role": "assistant", "content": answer[:1500]})
+    history += [{"role": "user", "content": question[:1000]}, {"role": "assistant", "content": answer[:1500]}]
+    await db.save_history(chat_id, history[-config.CHAT_HISTORY_TURNS * 2:])
     return answer
 
 
-async def ask_library(question: str, only: set[str] | None = None) -> tuple[str, list[Reel]]:
-    hits = index.search(question, k=config.SEARCH_TOP_K, only=only)
+async def ask_library(question: str, user_id: int) -> tuple[str, list[Reel]]:
+    hits = await db.search_library(user_id, question, limit=config.SEARCH_TOP_K)
     if not hits:
         return "I couldn't find any saved reels matching that. Try different keywords.", []
     per = (config.PROMPT_CHAR_BUDGET - 1000) // len(hits)

@@ -21,7 +21,7 @@ class Reel:
     author: str = ""
     date: str | None = None  # when the reel was posted (ISO 8601)
     analysis: str = "full"  # full / audio-only / caption-only
-    source: str = ""  # apify / yt-dlp / cobalt / forwarded
+    source: str = ""  # meta / apify / upload / phone
     model: str = ""
 
     def search_text(self) -> str:

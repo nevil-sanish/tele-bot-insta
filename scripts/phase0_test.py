@@ -3,9 +3,10 @@
     python -m scripts.phase0_test urls.txt          # one Instagram URL per line
     python -m scripts.phase0_test URL [URL ...]
 
-Prints per-reel fetch source/time, analysis model/mode, token usage and the
-title, then a summary. Writes full results to phase0_results.json.
-Needs APIFY_TOKEN (and/or yt-dlp working) + GEMINI_API_KEY; GROQ_API_KEY for the backup.
+Same path as production: one batched Apify lookup, then download → Gemini per
+reel. Prints per-reel analysis model/mode, token usage and the title, then a
+summary. Writes full results to phase0_results.json.
+Needs APIFY_TOKEN + GEMINI_API_KEY; GROQ_API_KEY for the backup.
 """
 
 import asyncio
@@ -16,8 +17,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fetchers import chain  # noqa: E402
+from app.pipeline import _download  # noqa: E402
+from fetchers import apify  # noqa: E402
 from services import analyze  # noqa: E402
+from services import caption as cap  # noqa: E402
 
 
 def read_urls(args: list[str]) -> list[str]:
@@ -31,13 +34,16 @@ def read_urls(args: list[str]) -> list[str]:
     return urls
 
 
-async def run_one(url: str) -> dict:
+async def run_one(url: str, meta: apify.ReelMeta | None) -> dict:
     row: dict = {"url": url}
+    if meta is None:
+        row.update(ok=False, stage="fetch", error="apify could not resolve the reel")
+        return row
     t0 = time.monotonic()
     try:
-        fetched = await chain.fetch(url)
+        fetched = await _download({**meta.to_payload(), "source": "apify"})
     except Exception as e:
-        row.update(ok=False, stage="fetch", error=str(e), fetch_s=round(time.monotonic() - t0, 1))
+        row.update(ok=False, stage="download", error=str(e))
         return row
     row.update(source=fetched.source, fetch_s=round(time.monotonic() - t0, 1),
                size_mb=round(sum(m.path.stat().st_size for m in fetched.media) / 1e6, 2),
@@ -58,9 +64,12 @@ async def main() -> None:
     urls = read_urls(sys.argv[1:])
     if not urls:
         sys.exit(__doc__)
+    t0 = time.monotonic()
+    found = await apify.lookup([cap.extract_shortcode(u) for u in urls if cap.extract_shortcode(u)])
+    print(f"Apify: {len(found)}/{len(urls)} reels resolved in one run, {time.monotonic() - t0:.0f}s\n")
     rows = []
     for i, url in enumerate(urls, 1):
-        row = await run_one(url)
+        row = await run_one(url, found.get(cap.extract_shortcode(url)))
         rows.append(row)
         if row["ok"]:
             u = row.get("usage") or {}

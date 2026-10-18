@@ -1,11 +1,13 @@
-"""Postgres (Neon) access: users, the global reel cache, libraries, the job
-queue and credits. Plain SQL over asyncpg; no ORM."""
+"""Postgres (Neon) access: accounts and identities, wallets, the global reel
+cache, libraries, conversations and the staged job queue. Plain SQL over
+asyncpg; no ORM. Layout: docs/ARCHITECTURE.md §6."""
 
 import json
 import logging
 import re
-from dataclasses import dataclass
-from datetime import timedelta
+import secrets
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import asyncpg
@@ -19,7 +21,8 @@ log = logging.getLogger(__name__)
 SCHEMA = Path(__file__).with_name("schema.sql")
 UNLIMITED = "unlimited"
 JOBS_CHANNEL = "reel_jobs"  # NOTIFY channel that wakes workers
-PRIORITY = {"premium": 10, UNLIMITED: 5, "free": 0}  # higher plans are served first
+PRIORITY = {"pro": 10, "basic": 5, UNLIMITED: 5, "free": 0}  # higher plans are served first
+LINK_CODE_MINUTES = 10
 
 _pool: asyncpg.Pool | None = None
 
@@ -58,18 +61,17 @@ def pool() -> asyncpg.Pool:
     return _pool
 
 
-# ---------------------------------------------------------------- users
+# ---------------------------------------------------------------- accounts
 
 
 @dataclass
-class User:
+class Account:
     id: int
     plan: str
-    credits: int
-    telegram_id: int | None = None
-    google_sub: str | None = None
-    email: str | None = None
+    units: int
+    free_granted: bool = False
     name: str | None = None
+    email: str | None = None
 
     @property
     def unlimited(self) -> bool:
@@ -79,64 +81,202 @@ class User:
     def priority(self) -> int:
         return PRIORITY.get(self.plan, 0)
 
+    def reels_left(self) -> int | None:
+        return None if self.unlimited else self.units // config.UNITS_PER_REEL
+
     def to_dict(self) -> dict:
-        return {"id": self.id, "plan": self.plan, "credits": self.credits, "email": self.email, "name": self.name}
+        return {
+            "id": self.id, "plan": self.plan, "units": self.units, "reels_left": self.reels_left(),
+            "name": self.name, "email": self.email,
+        }
 
 
-def _user(row) -> User | None:
-    if not row:
-        return None
-    return User(
-        id=row["id"], plan=row["plan"], credits=row["credits"], telegram_id=row["telegram_id"],
-        google_sub=row["google_sub"], email=row["email"], name=row["name"],
-    )
+_ACCOUNT_SQL = """
+    SELECT a.id, a.plan, w.units, w.free_granted,
+           (SELECT name FROM identities i WHERE i.account_id = a.id AND name IS NOT NULL ORDER BY i.id LIMIT 1) AS name,
+           (SELECT email FROM identities i WHERE i.account_id = a.id AND email IS NOT NULL ORDER BY i.id LIMIT 1) AS email
+    FROM accounts a JOIN wallets w ON w.account_id = a.id
+    WHERE a.id = $1"""
 
 
-async def telegram_user(telegram_id: int, name: str | None = None) -> User:
-    """Whitelisted Telegram users get the unlimited plan (no credits)."""
-    row = await pool().fetchrow(
-        """INSERT INTO users (telegram_id, name, plan) VALUES ($1, $2, $3)
-           ON CONFLICT (telegram_id) DO UPDATE SET plan = $3, name = COALESCE($2, users.name)
-           RETURNING *""",
-        telegram_id, name, UNLIMITED,
-    )
-    return _user(row)
+async def get_account(account_id: int, con=None) -> Account | None:
+    row = await (con or pool()).fetchrow(_ACCOUNT_SQL, account_id)
+    return Account(**dict(row)) if row else None
 
 
-async def google_user(sub: str, email: str | None, name: str | None) -> tuple[User, bool]:
-    """Find or create an app user from a verified Google login. Returns (user, created)."""
+async def _identity_account(
+    kind: str, external_id: str, email: str | None = None, name: str | None = None, plan: str = "free"
+) -> tuple[Account, bool]:
+    """Find or create the account behind an identity. New accounts get FREE_UNITS once."""
     async with pool().acquire() as con, con.transaction():
-        row = await con.fetchrow("SELECT * FROM users WHERE google_sub = $1", sub)
-        if row:
-            row = await con.fetchrow(
-                "UPDATE users SET email = $2, name = $3 WHERE id = $1 RETURNING *", row["id"], email, name
-            )
-            return _user(row), False
-        row = await con.fetchrow(
-            "INSERT INTO users (google_sub, email, name, credits) VALUES ($1, $2, $3, $4) RETURNING *",
-            sub, email, name, config.FREE_CREDITS,
+        account_id = await con.fetchval(
+            """UPDATE identities SET email = COALESCE($3, email), name = COALESCE($4, name)
+               WHERE kind = $1 AND external_id = $2 RETURNING account_id""",
+            kind, external_id, email, name,
         )
-        if config.FREE_CREDITS:
+        created = account_id is None
+        if created:
+            account_id = await con.fetchval("INSERT INTO accounts (plan) VALUES ($1) RETURNING id", plan)
+            # A racing request for the same identity loses here and retries as "found".
             await con.execute(
-                "INSERT INTO credit_ledger (user_id, delta, reason) VALUES ($1, $2, 'signup bonus')",
-                row["id"], config.FREE_CREDITS,
+                "INSERT INTO identities (account_id, kind, external_id, email, name) VALUES ($1, $2, $3, $4, $5)",
+                account_id, kind, external_id, email, name,
             )
-        return _user(row), True
+            await con.execute(
+                "INSERT INTO wallets (account_id, units, free_granted) VALUES ($1, $2, true)",
+                account_id, config.FREE_UNITS,
+            )
+            if config.FREE_UNITS:
+                await con.execute(
+                    "INSERT INTO ledger (account_id, delta, kind, note) VALUES ($1, $2, 'grant', 'free trial')",
+                    account_id, config.FREE_UNITS,
+                )
+        elif plan == UNLIMITED:
+            await con.execute("UPDATE accounts SET plan = $2 WHERE id = $1", account_id, plan)
+        return await get_account(account_id, con), created
 
 
-async def get_user(user_id: int) -> User | None:
-    return _user(await pool().fetchrow("SELECT * FROM users WHERE id = $1", user_id))
+async def ig_account(igsid: str, name: str | None = None) -> tuple[Account, bool]:
+    plan = UNLIMITED if igsid in config.ADMIN_IG_IDS else "free"
+    try:
+        return await _identity_account("ig", igsid, name=name, plan=plan)
+    except asyncpg.UniqueViolationError:
+        return await _identity_account("ig", igsid, name=name, plan=plan)
 
 
-async def add_credits(user_id: int, delta: int, reason: str) -> int:
+async def google_account(sub: str, email: str | None, name: str | None) -> tuple[Account, bool]:
+    try:
+        return await _identity_account("google", sub, email=email, name=name)
+    except asyncpg.UniqueViolationError:
+        return await _identity_account("google", sub, email=email, name=name)
+
+
+async def identities(account_id: int) -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT kind, external_id, email, name FROM identities WHERE account_id = $1 ORDER BY id", account_id
+    )
+    return [dict(r) for r in rows]
+
+
+async def set_plan(account_id: int, plan: str) -> None:
+    await pool().execute("UPDATE accounts SET plan = $2 WHERE id = $1", account_id, plan)
+
+
+# ---------------------------------------------------------------- linking
+
+
+async def new_link_code(account_id: int) -> str:
+    """6-digit code the app shows; the user DMs "link <code>" to the bot."""
+    await pool().execute("DELETE FROM link_codes WHERE account_id = $1 OR expires_at < now()", account_id)
+    for _ in range(5):
+        code = f"{secrets.randbelow(10**6):06d}"
+        try:
+            await pool().execute(
+                "INSERT INTO link_codes (code, account_id, expires_at) VALUES ($1, $2, now() + $3::interval)",
+                code, account_id, timedelta(minutes=LINK_CODE_MINUTES),
+            )
+            return code
+        except asyncpg.UniqueViolationError:
+            continue
+    raise DBError("could not allocate a link code")
+
+
+async def link_with_code(code: str, account_id: int) -> Account | None:
+    """Merge `account_id` (the Instagram side) into the account that made `code`.
+    Returns the merged account, or None if the code is wrong or expired."""
     async with pool().acquire() as con, con.transaction():
-        credits = await con.fetchval(
-            "UPDATE users SET credits = GREATEST(credits + $2, 0) WHERE id = $1 RETURNING credits", user_id, delta
+        target = await con.fetchval(
+            "DELETE FROM link_codes WHERE code = $1 AND expires_at > now() RETURNING account_id", code.strip()
         )
-        await con.execute(
-            "INSERT INTO credit_ledger (user_id, delta, reason) VALUES ($1, $2, $3)", user_id, delta, reason
+        if target is None:
+            return None
+        if target != account_id:
+            await _merge(con, source=account_id, target=target)
+        return await get_account(target, con)
+
+
+async def _merge(con, source: int, target: int) -> None:
+    src = await con.fetchrow(
+        "SELECT a.plan, w.units, w.free_granted FROM accounts a JOIN wallets w ON w.account_id = a.id WHERE a.id = $1 FOR UPDATE",
+        source,
+    )
+    dst = await con.fetchrow(
+        "SELECT a.plan, w.units, w.free_granted FROM accounts a JOIN wallets w ON w.account_id = a.id WHERE a.id = $1 FOR UPDATE",
+        target,
+    )
+    units = src["units"]
+    if src["free_granted"] and dst["free_granted"]:
+        units = max(units - config.FREE_UNITS, 0)  # one free trial per person, not per login
+    plan = max((src["plan"], dst["plan"]), key=lambda p: PRIORITY.get(p, 0))
+    await con.execute("UPDATE accounts SET plan = $2 WHERE id = $1", target, plan)
+    await con.execute("UPDATE wallets SET units = units + $2, free_granted = true WHERE account_id = $1", target, units)
+    await con.execute(
+        "INSERT INTO ledger (account_id, delta, kind, note) VALUES ($1, $2, 'merge', $3)",
+        target, units, f"linked account {source}",
+    )
+    await con.execute("UPDATE identities SET account_id = $2 WHERE account_id = $1", source, target)
+    await con.execute(
+        """INSERT INTO library (account_id, shortcode, via, added_at)
+           SELECT $2, shortcode, via, added_at FROM library WHERE account_id = $1
+           ON CONFLICT (account_id, shortcode) DO NOTHING""",
+        source, target,
+    )
+    await con.execute(
+        """INSERT INTO conversations SELECT $2, channel, active_shortcode, active_at, history, pending_shortcode,
+               last_inbound_at FROM conversations WHERE account_id = $1
+           ON CONFLICT (account_id, channel) DO NOTHING""",
+        source, target,
+    )
+    await con.execute("UPDATE jobs SET account_id = $2 WHERE account_id = $1", source, target)
+    await con.execute("UPDATE ledger SET account_id = $2 WHERE account_id = $1", source, target)
+    await con.execute("DELETE FROM accounts WHERE id = $1", source)
+
+
+# ---------------------------------------------------------------- wallet
+
+
+async def _reserve(con, account_id: int, units: int, note: str, job_id: int | None = None) -> int | None:
+    """Hold `units` for a job. Returns units held (0 on unlimited), None if the balance is short."""
+    plan = await con.fetchval("SELECT plan FROM accounts WHERE id = $1", account_id)
+    if plan == UNLIMITED or units <= 0:
+        return 0
+    ok = await con.fetchval(
+        "UPDATE wallets SET units = units - $2 WHERE account_id = $1 AND units >= $2 RETURNING 1", account_id, units
+    )
+    if not ok:
+        return None
+    await con.execute(
+        "INSERT INTO ledger (account_id, delta, kind, job_id, note) VALUES ($1, $2, 'reserve', $3, $4)",
+        account_id, -units, job_id, note,
+    )
+    return units
+
+
+async def _refund(con, job_id: int) -> None:
+    row = await con.fetchrow("SELECT account_id, reserved FROM jobs WHERE id = $1 FOR UPDATE", job_id)
+    if not row or row["reserved"] <= 0:
+        return
+    await con.execute("UPDATE jobs SET reserved = 0 WHERE id = $1", job_id)
+    await con.execute("UPDATE wallets SET units = units + $2 WHERE account_id = $1", row["account_id"], row["reserved"])
+    await con.execute(
+        "INSERT INTO ledger (account_id, delta, kind, job_id, note) VALUES ($1, $2, 'refund', $3, 'job failed')",
+        row["account_id"], row["reserved"], job_id,
+    )
+
+
+async def grant(account_id: int, units: int, kind: str, note: str, idem_key: str | None = None) -> bool:
+    """Add units (purchase, admin adjust). Replaying the same idem_key does nothing. Returns True if applied."""
+    async with pool().acquire() as con, con.transaction():
+        applied = await con.fetchval(
+            """INSERT INTO ledger (account_id, delta, kind, note, idem_key) VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (idem_key) DO NOTHING RETURNING 1""",
+            account_id, units, kind, note, idem_key,
         )
-        return credits
+        if applied:
+            await con.execute(
+                "UPDATE wallets SET units = GREATEST(units + $2, 0) WHERE account_id = $1", account_id, units
+            )
+        return bool(applied)
 
 
 # ---------------------------------------------------------------- reels + libraries
@@ -162,112 +302,133 @@ def _reel_values(r: Reel) -> list:
     ]
 
 
-async def get_reel(shortcode: str) -> Reel | None:
-    return _reel(await pool().fetchrow("SELECT * FROM reels WHERE shortcode = $1", shortcode))
+async def get_reel(shortcode: str, con=None) -> Reel | None:
+    return _reel(await (con or pool()).fetchrow(
+        "SELECT * FROM reels WHERE shortcode = $1 AND NOT hidden", shortcode
+    ))
 
 
-async def save_reel(con, reel: Reel) -> None:
-    cols = ", ".join(_REEL_COLS)
-    params = ", ".join(f"${i}" for i in range(1, len(_REEL_COLS) + 1))
-    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in _REEL_COLS[1:])
+async def save_reel(con, reel: Reel, origin: str = "server", uploader_id: int | None = None) -> None:
+    """Insert or replace a reel. A server analysis always replaces a phone one, never the reverse."""
+    cols = _REEL_COLS + ["origin", "uploader_id"]
+    params = ", ".join(f"${i}" for i in range(1, len(cols) + 1))
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols[1:])
     await con.execute(
-        f"INSERT INTO reels ({cols}) VALUES ({params}) ON CONFLICT (shortcode) DO UPDATE SET {updates}",
-        *_reel_values(reel),
+        f"""INSERT INTO reels ({", ".join(cols)}) VALUES ({params})
+            ON CONFLICT (shortcode) DO UPDATE SET {updates}, hidden = false, reports = 0
+            WHERE reels.origin = 'client' OR EXCLUDED.origin = 'server'""",
+        *_reel_values(reel), origin, uploader_id,
     )
 
 
-async def add_to_library(user_id: int, shortcode: str, con=None) -> None:
+async def add_to_library(account_id: int, shortcode: str, via: str = "ig", con=None) -> None:
     await (con or pool()).execute(
-        """INSERT INTO user_reels (user_id, shortcode) VALUES ($1, $2)
-           ON CONFLICT (user_id, shortcode) DO UPDATE SET saved_at = now()""",
-        user_id, shortcode,
+        """INSERT INTO library (account_id, shortcode, via) VALUES ($1, $2, $3)
+           ON CONFLICT (account_id, shortcode) DO UPDATE SET added_at = now()""",
+        account_id, shortcode, via,
     )
 
 
-async def library(user_id: int, limit: int = 20, offset: int = 0) -> list[Reel]:
+async def library(account_id: int, limit: int = 20, offset: int = 0) -> list[Reel]:
     rows = await pool().fetch(
-        """SELECT r.* FROM user_reels u JOIN reels r USING (shortcode)
-           WHERE u.user_id = $1 ORDER BY u.saved_at DESC LIMIT $2 OFFSET $3""",
-        user_id, limit, offset,
+        """SELECT r.* FROM library l JOIN reels r USING (shortcode)
+           WHERE l.account_id = $1 AND NOT r.hidden ORDER BY l.added_at DESC LIMIT $2 OFFSET $3""",
+        account_id, limit, offset,
     )
     return [_reel(r) for r in rows]
 
 
-async def library_shortcodes(user_id: int) -> set[str]:
-    rows = await pool().fetch("SELECT shortcode FROM user_reels WHERE user_id = $1", user_id)
-    return {r["shortcode"] for r in rows}
-
-
-async def in_library(user_id: int, shortcode: str) -> bool:
+async def in_library(account_id: int, shortcode: str) -> bool:
     return bool(await pool().fetchval(
-        "SELECT 1 FROM user_reels WHERE user_id = $1 AND shortcode = $2", user_id, shortcode
+        "SELECT 1 FROM library WHERE account_id = $1 AND shortcode = $2", account_id, shortcode
     ))
 
 
-async def search_library(user_id: int, query: str, limit: int = 3) -> list[Reel]:
-    """Full-text search over one user's library, best matches first (any word may match)."""
+async def search_library(account_id: int, query: str, limit: int = 3) -> list[Reel]:
+    """Full-text search over one person's library, best matches first (any word may match)."""
     terms = re.findall(r"\w+", (query or "").lower())[:12]
     if not terms:
         return []
     rows = await pool().fetch(
-        """SELECT r.* FROM user_reels u JOIN reels r USING (shortcode),
+        """SELECT r.* FROM library l JOIN reels r USING (shortcode),
                   to_tsquery('english', $2) AS q
-           WHERE u.user_id = $1 AND r.search @@ q
-           ORDER BY ts_rank(r.search, q) DESC, u.saved_at DESC LIMIT $3""",
-        user_id, " | ".join(terms), limit,
+           WHERE l.account_id = $1 AND NOT r.hidden AND r.search @@ q
+           ORDER BY ts_rank(r.search, q) DESC, l.added_at DESC LIMIT $3""",
+        account_id, " | ".join(terms), limit,
     )
     return [_reel(r) for r in rows]
 
 
-# ---------------------------------------------------------------- chat state
+# ---------------------------------------------------------------- conversations
 
 
-async def get_chat(chat_id: int) -> tuple[Reel | None, list[dict], str | None]:
-    """(active reel, recent Q&A history, link waiting for a forwarded video)."""
-    row = await pool().fetchrow("SELECT * FROM chat_state WHERE chat_id = $1", chat_id)
+@dataclass
+class Conversation:
+    active: Reel | None = None
+    active_at: datetime | None = None
+    history: list[dict] = field(default_factory=list)
+    pending_shortcode: str | None = None
+    last_inbound_at: datetime | None = None
+
+
+async def get_conversation(account_id: int, channel: str) -> Conversation:
+    row = await pool().fetchrow(
+        "SELECT * FROM conversations WHERE account_id = $1 AND channel = $2", account_id, channel
+    )
     if not row:
-        return None, [], None
+        return Conversation()
     active = await get_reel(row["active_shortcode"]) if row["active_shortcode"] else None
-    return active, row["history"], row["pending_link"]
+    return Conversation(active, row["active_at"], row["history"], row["pending_shortcode"], row["last_inbound_at"])
 
 
-async def set_active_reel(chat_id: int, shortcode: str) -> None:
+async def _upsert_conversation(account_id: int, channel: str, values: dict[str, str], *args) -> None:
+    """values: column → SQL expression (args are $3, $4, …)."""
+    cols, exprs = ", ".join(values), ", ".join(values.values())
+    sets = ", ".join(f"{c} = {e}" for c, e in values.items())
     await pool().execute(
-        """INSERT INTO chat_state (chat_id, active_shortcode) VALUES ($1, $2)
-           ON CONFLICT (chat_id) DO UPDATE SET active_shortcode = $2, history = '[]', updated_at = now()""",
-        chat_id, shortcode,
+        f"""INSERT INTO conversations (account_id, channel, {cols}) VALUES ($1, $2, {exprs})
+            ON CONFLICT (account_id, channel) DO UPDATE SET {sets}""",
+        account_id, channel, *args,
     )
 
 
-async def save_history(chat_id: int, history: list[dict]) -> None:
-    await pool().execute(
-        """INSERT INTO chat_state (chat_id, history) VALUES ($1, $2)
-           ON CONFLICT (chat_id) DO UPDATE SET history = $2, updated_at = now()""",
-        chat_id, history,
+async def touch_inbound(account_id: int, channel: str) -> None:
+    await _upsert_conversation(account_id, channel, {"last_inbound_at": "now()"})
+
+
+async def set_active_reel(account_id: int, channel: str, shortcode: str) -> None:
+    """Questions now go to this reel; a new reel starts a fresh Q&A history."""
+    await _upsert_conversation(
+        account_id, channel, {"active_shortcode": "$3", "active_at": "now()", "history": "'[]'::jsonb"}, shortcode
     )
 
 
-async def set_pending_link(chat_id: int, link: str | None) -> None:
-    await pool().execute(
-        """INSERT INTO chat_state (chat_id, pending_link) VALUES ($1, $2)
-           ON CONFLICT (chat_id) DO UPDATE SET pending_link = $2, updated_at = now()""",
-        chat_id, link,
-    )
+async def save_history(account_id: int, channel: str, history: list[dict]) -> None:
+    await _upsert_conversation(account_id, channel, {"history": "$3::jsonb", "active_at": "now()"}, history)
 
 
-async def pop_pending_link(chat_id: int) -> str | None:
-    """Take the waiting link (if any) and clear it, atomically."""
+async def set_pending(account_id: int, channel: str, shortcode: str | None) -> None:
+    await _upsert_conversation(account_id, channel, {"pending_shortcode": "$3"}, shortcode)
+
+
+async def pop_pending(account_id: int, channel: str) -> str | None:
+    """Take the reel waiting for a video (if any) and clear it, atomically."""
     return await pool().fetchval(
-        """WITH old AS (SELECT pending_link FROM chat_state WHERE chat_id = $1 FOR UPDATE)
-           UPDATE chat_state c SET pending_link = NULL, updated_at = now() FROM old
-           WHERE c.chat_id = $1 AND old.pending_link IS NOT NULL
-           RETURNING old.pending_link""",
-        chat_id,
+        """WITH old AS (SELECT pending_shortcode FROM conversations
+                        WHERE account_id = $1 AND channel = $2 FOR UPDATE)
+           UPDATE conversations c SET pending_shortcode = NULL FROM old
+           WHERE c.account_id = $1 AND c.channel = $2 AND old.pending_shortcode IS NOT NULL
+           RETURNING old.pending_shortcode""",
+        account_id, channel,
     )
 
 
-async def reset_chat(chat_id: int) -> None:
-    await pool().execute("DELETE FROM chat_state WHERE chat_id = $1", chat_id)
+async def reset_conversation(account_id: int, channel: str) -> None:
+    await pool().execute(
+        """UPDATE conversations SET active_shortcode = NULL, active_at = NULL, history = '[]', pending_shortcode = NULL
+           WHERE account_id = $1 AND channel = $2""",
+        account_id, channel,
+    )
 
 
 # ---------------------------------------------------------------- job queue
@@ -276,20 +437,18 @@ async def reset_chat(chat_id: int) -> None:
 @dataclass
 class Job:
     id: int
-    user_id: int
-    shortcode: str
-    url: str | None = None
-    file_id: str | None = None
-    mime_type: str = "video/mp4"
-    chat_id: int | None = None
-    status_message_id: int | None = None
+    account_id: int
+    kind: str
+    stage: str
+    channel: str
     status: str = "queued"
+    recipient: str | None = None
+    shortcode: str | None = None
+    payload: dict = field(default_factory=dict)
+    priority: int = 0
+    reserved: int = 0
     attempts: int = 0
     error: str | None = None
-
-    @property
-    def link(self) -> str:
-        return f"https://www.instagram.com/reel/{self.shortcode}/" if self.url else ""
 
 
 def _job(row) -> Job | None:
@@ -298,56 +457,77 @@ def _job(row) -> Job | None:
     return Job(**{k: row[k] for k in Job.__dataclass_fields__})
 
 
-async def enqueue(
-    user_id: int, shortcode: str, url: str | None = None, file_id: str | None = None,
-    mime_type: str = "video/mp4", chat_id: int | None = None, status_message_id: int | None = None,
-    priority: int = 0,
-) -> Job:
-    async with pool().acquire() as con, con.transaction():
-        row = await con.fetchrow(
-            """INSERT INTO jobs (user_id, shortcode, url, file_id, mime_type, chat_id, status_message_id, priority)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *""",
-            user_id, shortcode, url, file_id, mime_type, chat_id, status_message_id, priority,
-        )
-        await con.execute(f"NOTIFY {JOBS_CHANNEL}")  # delivered to workers on commit
+class _ShortBalance(Exception):
+    pass
+
+
+async def create_job(
+    account_id: int, kind: str, stage: str, channel: str, *, units: int, recipient: str | None = None,
+    shortcode: str | None = None, payload: dict | None = None, priority: int = 0, note: str = "",
+) -> Job | None:
+    """Reserve `units` and queue a job in one transaction. None if the balance is short."""
+    try:
+        async with pool().acquire() as con, con.transaction():
+            row = await con.fetchrow(
+                """INSERT INTO jobs (account_id, kind, stage, channel, recipient, shortcode, payload, priority)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *""",
+                account_id, kind, stage, channel, recipient, shortcode, payload or {}, priority,
+            )
+            held = await _reserve(con, account_id, units, note or f"{kind} {shortcode or ''}".strip(), row["id"])
+            if held is None:
+                raise _ShortBalance
+            if held:
+                row = await con.fetchrow("UPDATE jobs SET reserved = $2 WHERE id = $1 RETURNING *", row["id"], held)
+            await con.execute(f"NOTIFY {JOBS_CHANNEL}")  # delivered to workers on commit
+    except _ShortBalance:
+        return None
     return _job(row)
 
 
-async def claim_job() -> Job | None:
-    """Take the next runnable job: highest priority, then oldest. A running job whose
-    heartbeat stopped (crash, redeploy) is taken over. Jobs for a reel that already
-    has a running job wait, so one reel is never analyzed twice at once; the unique
-    index enforces that across machines too (a lost race just returns None)."""
+_CLAIMABLE = """
+    SELECT j.id FROM jobs j
+    WHERE (j.status = 'queued' OR (j.status = 'running' AND j.locked_at < now() - $1::interval))
+      AND ($2::text IS NULL OR j.stage = $2)
+      AND NOT (j.stage = 'analyze' AND EXISTS (
+          SELECT 1 FROM jobs r WHERE r.shortcode = j.shortcode AND r.id <> j.id
+            AND r.status = 'running' AND r.stage = 'analyze'))
+    ORDER BY j.priority DESC, j.id
+    FOR UPDATE SKIP LOCKED
+    LIMIT $3"""
+
+
+async def claim_jobs(stage: str | None = None, limit: int = 1) -> list[Job]:
+    """Take the next runnable jobs: highest priority, then oldest. A running job whose
+    heartbeat stopped (crash, redeploy) is taken over. An analysis waits while the same
+    reel is being analyzed elsewhere; the unique index enforces that across machines
+    (a lost race just returns nothing)."""
     stale = timedelta(seconds=config.JOB_LOCK_TIMEOUT)
     try:
         async with pool().acquire() as con, con.transaction():
-            await con.execute(
-                """UPDATE jobs SET status = 'failed', error = COALESCE(error, 'gave up after repeated crashes'),
-                       updated_at = now()
-                   WHERE status = 'running' AND locked_at < now() - $1::interval AND attempts >= $2""",
+            dead = await con.fetch(
+                """SELECT id FROM jobs WHERE status = 'running' AND locked_at < now() - $1::interval
+                   AND attempts >= $2 FOR UPDATE SKIP LOCKED""",
                 stale, config.JOB_MAX_ATTEMPTS,
             )
-            row = await con.fetchrow(
-                """UPDATE jobs SET status = 'running', locked_at = now(), attempts = attempts + 1, updated_at = now()
-                   WHERE id = (
-                       SELECT j.id FROM jobs j
-                       WHERE (j.status = 'queued' OR (j.status = 'running' AND j.locked_at < now() - $1::interval))
-                         AND NOT EXISTS (
-                             SELECT 1 FROM jobs r
-                             WHERE r.shortcode = j.shortcode AND r.id <> j.id AND r.status = 'running')
-                       ORDER BY j.priority DESC, j.id
-                       FOR UPDATE SKIP LOCKED
-                       LIMIT 1)
-                   RETURNING *""",
-                stale,
+            for r in dead:
+                await _fail(con, r["id"], "gave up after repeated crashes")
+            rows = await con.fetch(
+                f"""UPDATE jobs SET status = 'running', locked_at = now(), attempts = attempts + 1, updated_at = now()
+                    WHERE id IN ({_CLAIMABLE}) RETURNING *""",
+                stale, stage, limit,
             )
-            return _job(row)
+            return sorted((_job(r) for r in rows), key=lambda j: (-j.priority, j.id))
     except asyncpg.UniqueViolationError:
-        return None  # another machine claimed this reel a moment ago
+        return []  # another machine claimed this reel's analysis a moment ago
+
+
+async def claim_job(stage: str | None = None) -> Job | None:
+    jobs = await claim_jobs(stage, 1)
+    return jobs[0] if jobs else None
 
 
 async def listen_for_jobs(on_job, dsn: str | None = None) -> asyncpg.Connection:
-    """Dedicated connection that calls on_job() whenever a job is enqueued anywhere.
+    """Dedicated connection that calls on_job() whenever a job is queued anywhere.
     Needs a direct (non-pooled) connection; Neon's direct host is the pooled one
     without '-pooler'."""
     dsn = dsn or config.DATABASE_LISTEN_URL or config.DATABASE_URL.replace("-pooler.", ".")
@@ -369,75 +549,93 @@ async def requeue(job_id: int) -> None:
     )
 
 
-async def finish_job(job: Job, reel: Reel, analyzed: bool) -> bool:
-    """Save the reel (if newly analyzed), add it to the user's library and charge
-    one credit for a fresh analysis on a credit plan. Returns True if charged."""
+async def advance(job: Job, stage: str, con=None, shortcode: str | None = None, **payload) -> None:
+    """Hand the job to its next stage (fresh attempts), merging `payload`."""
+    job.payload.update(payload)
+    job.stage = stage
+    if shortcode:
+        job.shortcode = shortcode
+    con = con or pool()
+    await con.execute(
+        """UPDATE jobs SET stage = $2, status = 'queued', payload = $3, shortcode = COALESCE($4, shortcode),
+               attempts = 0, locked_at = NULL, error = NULL, updated_at = now() WHERE id = $1""",
+        job.id, stage, job.payload, shortcode,
+    )
+    await con.execute(f"NOTIFY {JOBS_CHANNEL}")
+
+
+async def save_analysis(job: Job, reel: Reel, origin: str = "server") -> None:
+    """Store the reel globally, add it to the requester's library and move on to delivery."""
     async with pool().acquire() as con, con.transaction():
-        if analyzed:
-            await save_reel(con, reel)
-        await add_to_library(job.user_id, reel.shortcode, con)
-        charged = False
-        if analyzed:
-            charged = bool(await con.fetchval(
-                """UPDATE users SET credits = credits - 1
-                   WHERE id = $1 AND plan <> $2 AND credits > 0 RETURNING 1""",
-                job.user_id, UNLIMITED,
-            ))
-            if charged:
-                await con.execute(
-                    "INSERT INTO credit_ledger (user_id, delta, reason, job_id) VALUES ($1, -1, 'analysis', $2)",
-                    job.user_id, job.id,
-                )
-        await con.execute(
-            """UPDATE jobs SET status = 'done', error = NULL, charged = $2, locked_at = NULL, updated_at = now()
-               WHERE id = $1""",
-            job.id, charged,
-        )
-        return charged
+        await save_reel(con, reel, origin)
+        await add_to_library(job.account_id, reel.shortcode, job.channel, con)
+        await advance(job, "deliver", con, shortcode=reel.shortcode)
 
 
-async def fail_job(job_id: int, error: str) -> None:
+async def finish_job(job_id: int, **payload) -> None:
     await pool().execute(
+        """UPDATE jobs SET status = 'done', error = NULL, locked_at = NULL, updated_at = now(),
+               payload = payload || $2::jsonb WHERE id = $1""",
+        job_id, payload,
+    )
+
+
+async def _fail(con, job_id: int, error: str, refund: bool = True) -> None:
+    await con.execute(
         "UPDATE jobs SET status = 'failed', error = $2, locked_at = NULL, updated_at = now() WHERE id = $1",
         job_id, error[:1000],
     )
+    if refund:
+        await _refund(con, job_id)
+
+
+async def fail_job(job_id: int, error: str, refund: bool = True) -> None:
+    """Mark failed and give the held units back (unless the user already got what they paid for)."""
+    async with pool().acquire() as con, con.transaction():
+        await _fail(con, job_id, error, refund)
 
 
 async def get_job(job_id: int) -> Job | None:
     return _job(await pool().fetchrow("SELECT * FROM jobs WHERE id = $1", job_id))
 
 
-async def pending_jobs(user_id: int) -> int:
+async def pending_jobs(account_id: int) -> int:
     return await pool().fetchval(
-        "SELECT count(*) FROM jobs WHERE user_id = $1 AND status IN ('queued', 'running')", user_id
-    )
-
-
-async def failed_jobs(user_id: int, limit: int = 5) -> list[Job]:
-    """Latest failed job per reel that hasn't since succeeded."""
-    rows = await pool().fetch(
-        """SELECT DISTINCT ON (j.shortcode) j.* FROM jobs j
-           WHERE j.user_id = $1 AND j.status = 'failed'
-             AND NOT EXISTS (SELECT 1 FROM user_reels u WHERE u.user_id = j.user_id AND u.shortcode = j.shortcode)
-             AND NOT EXISTS (SELECT 1 FROM jobs q WHERE q.shortcode = j.shortcode AND q.user_id = j.user_id
-                             AND q.status IN ('queued', 'running'))
-           ORDER BY j.shortcode, j.id DESC LIMIT $2""",
-        user_id, limit,
-    )
-    return [_job(r) for r in rows]
-
-
-async def retry_job(job_id: int, chat_id: int | None = None, status_message_id: int | None = None) -> None:
-    await pool().execute(
-        """UPDATE jobs SET status = 'queued', attempts = 0, error = NULL, locked_at = NULL, updated_at = now(),
-               chat_id = COALESCE($2, chat_id), status_message_id = COALESCE($3, status_message_id)
-           WHERE id = $1""",
-        job_id, chat_id, status_message_id,
+        "SELECT count(*) FROM jobs WHERE account_id = $1 AND status IN ('queued', 'running')", account_id
     )
 
 
 async def queue_size() -> int:
     return await pool().fetchval("SELECT count(*) FROM jobs WHERE status IN ('queued', 'running')")
+
+
+# ---------------------------------------------------------------- webhooks + settings
+
+
+async def first_delivery(platform: str, message_id: str, payload: dict | None = None) -> bool:
+    """True the first time we see this message (Meta retries deliveries)."""
+    return bool(await pool().fetchval(
+        """INSERT INTO inbound_events (platform, message_id, payload) VALUES ($1, $2, $3)
+           ON CONFLICT DO NOTHING RETURNING 1""",
+        platform, message_id, payload,
+    ))
+
+
+async def prune_inbound(days: int = 7) -> None:
+    await pool().execute("DELETE FROM inbound_events WHERE received_at < now() - $1::interval", timedelta(days=days))
+
+
+async def kv_get(key: str) -> tuple[str, datetime] | None:
+    row = await pool().fetchrow("SELECT value, updated_at FROM kv WHERE key = $1", key)
+    return (row["value"], row["updated_at"]) if row else None
+
+
+async def kv_set(key: str, value: str) -> None:
+    await pool().execute(
+        """INSERT INTO kv (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()""",
+        key, value,
+    )
 
 
 # ---------------------------------------------------------------- API usage

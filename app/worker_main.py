@@ -1,5 +1,6 @@
-"""Standalone worker process (ROLE=worker): analyzes queued reels and posts
-results to Telegram. Run as many as you need; they share the Postgres queue.
+"""Standalone worker process (ROLE=worker): fetches, analyzes and delivers
+queued reels and answers questions. Run as many as you need; they share the
+Postgres queue.
 
     python -m app.worker_main
 """
@@ -8,10 +9,9 @@ import asyncio
 import logging
 import signal
 
-from telegram import Bot
-
 from app import config
 from app.worker import Worker
+from channels.instagram import Messenger
 from services import db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -20,12 +20,14 @@ log = logging.getLogger("reel-brain.worker")
 
 
 async def main() -> None:
-    if not (config.TELEGRAM_TOKEN and config.DATABASE_URL):
-        raise SystemExit("TELEGRAM_TOKEN and DATABASE_URL must be set.")
+    if not config.DATABASE_URL:
+        raise SystemExit("DATABASE_URL must be set.")
+    missing = config.missing_required()
+    if missing:
+        log.warning("missing environment variables: %s", ", ".join(missing))
     await db.connect()
-    bot = Bot(config.TELEGRAM_TOKEN)  # only used to post status updates and results
-    await bot.initialize()
-    worker = Worker(bot)
+    out = Messenger()
+    worker = Worker(out)
     worker.start(config.WORKER_CONCURRENCY)
     log.info("worker started: %d concurrent jobs", config.WORKER_CONCURRENCY)
 
@@ -37,7 +39,7 @@ async def main() -> None:
 
     log.info("shutting down: running jobs go back on the queue")
     await worker.stop()
-    await bot.shutdown()
+    await out.close()
     await db.close()
 
 

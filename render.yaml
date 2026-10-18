@@ -2,14 +2,19 @@ services:
   - type: web
     name: reel-brain
     runtime: docker
-    plan: free
+    # Paid (Starter) so it never sleeps: Meta disables webhooks that keep timing out.
+    plan: starter
     healthCheckPath: /health
     envVars:
-      - key: TELEGRAM_TOKEN
+      - key: DATABASE_URL
         sync: false
-      - key: WEBHOOK_SECRET   # letters, digits, _ and - only (Telegram rule)
+      - key: INSTAGRAM_APP_SECRET
         sync: false
-      - key: ALLOWED_USER_IDS
+      - key: INSTAGRAM_VERIFY_TOKEN
+        sync: false
+      - key: INSTAGRAM_ACCESS_TOKEN
+        sync: false
+      - key: ADMIN_IG_IDS
         sync: false
       - key: GEMINI_API_KEY
         sync: false
@@ -17,17 +22,12 @@ services:
         sync: false
       - key: APIFY_TOKEN
         sync: false
-      - key: DATABASE_URL
-        sync: false
       - key: APP_SECRET
         sync: false
       - key: GOOGLE_CLIENT_IDS
         sync: false
-      - key: COBALT_URL
-        sync: false
 
-# Scaling out (paid; Render has no free background workers): set ROLE=web on the
-# service above and add workers from the same image, e.g.
+# Scaling out: set ROLE=web on the service above and add workers from the same image, e.g.
 #
 #  - type: worker
 #    name: reel-brain-worker

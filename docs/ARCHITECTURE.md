@@ -1,6 +1,6 @@
 # Reel Brain — Architecture Spec (v1 draft, for approval)
 
-Status: **draft — no code until this is approved.**
+Status: **approved (Oct 2026).** P0 spikes partly done (see §10.1); P1 server core built; next is Meta setup by Nevil.
 Scope is fixed to two platforms: an **Instagram DM bot** and an **Android app** (Flutter).
 No Telegram bot, no web app.
 
@@ -33,7 +33,7 @@ No Telegram bot, no web app.
 | A3 | AI / fetch | Gemini paid tier + Groq + Apify paid, multiple keys | Free tiers can't carry paying users |
 | A4 | Team | You alone, part-time | Drives scope of v1 |
 | A5 | Legal entity | Sole proprietor for now; Meta Business Verification + Razorpay KYC in your name | Both need *some* verified identity |
-| A6 | Telegram bot | **Retire it** — Render service gets repurposed | Final scope says no Telegram |
+| A6 | Telegram bot | **Retired in P1**: the Render service is repurposed for the Instagram webhook | Final scope says no Telegram |
 | A7 | Stashed WIP | Keep `spec/analysis.json` + Flutter pipeline pieces; drop the rest | Shared output schema is still useful |
 | A8 | Credits expiry | Plan credits reset each billing month (no rollover) | Simplest to account for |
 | A9 | Data retention | Videos deleted right after analysis; only text kept | Lower storage, lower legal risk |
@@ -81,7 +81,7 @@ Worst case if Meta ever restricts the bot: the app keeps working on its own, and
 
 ## 3. Instagram bot
 
-### 3.1 Setup (one-time, needs you)
+### 3.1 Setup (one-time, needs you — step by step in [SETUP_META.md](SETUP_META.md))
 1. New Instagram account → switch to **Professional (Creator or Business)**.
 2. Meta developer app → add **Instagram** product (Instagram Login flavour) → connect the account.
 3. Webhook subscription: `messages`, `messaging_postbacks`, `message_reactions` (optional).
@@ -267,6 +267,24 @@ Rough capacity target for v1: 1,000 users, ~5,000 reels/day, p50 < 60 s end to e
 | **P4 – Launch** | App Review, privacy policy, data deletion, monitoring | Public bot + Play Store listing |
 
 ---
+
+### 10.1 Phase 0 results
+
+| Spike | Result | Status |
+|---|---|---|
+| Apify batch cost | 13/13 reels in **one 13 s run**, **$0.0023 per reel** (≈ ₹0.19); video URLs download from a server (HTTP 206, video/mp4) | ✅ done |
+| End-to-end on live reels | 5/5 analyzed; avg **2.3k input / 0.3k output tokens** per reel; 6–20 s normally, up to ~60 s when Gemini returns 503 and we fall back across models | ✅ done |
+| Meta `ig_reel` webhook shape | Meta's docs list `title`, `url` and a video id but don't pin the key names. The code accepts `reel_video_id`/`video_id`/`id` and logs the keys of every attachment | ⏳ needs Meta setup (SETUP_META.md step 5) |
+| WebView logged-out fetch rate | Belongs with the app (P3); measured on a real phone, since datacenter IPs aren't representative | ⏳ P3 |
+| Standard vs Advanced Access | Docs say Standard works for accounts we own or added as testers; the public needs Advanced Access (App Review) | ⏳ confirm during setup |
+
+### 10.2 What P1 built (server core)
+- Schema v2 (§6), minus `subscriptions` / `payment_events`, which come with payments (P2).
+- Identities and linking via a 6-digit code; wallet with reserve/refund and an idempotent ledger.
+- Staged queue: fetch (batched Apify) → analyze → deliver, and chat.
+- Instagram webhook (signature, dedupe, handshake), Send API with retries and the 24-hour window error, and weekly token refresh.
+- DM commands, Q&A, and the app API under `/v1`.
+- Removed: the Telegram bot, yt-dlp, Cobalt and instaloader (they all fetched from Instagram using our servers).
 
 ## 11. Open questions (round 5–6, answer when ready)
 1. Hosting budget per month (₹/$)? Render vs Google Cloud Run?

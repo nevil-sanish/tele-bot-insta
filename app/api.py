@@ -1,11 +1,12 @@
-"""REST API for the Android app.
+"""REST API for the Android app (/v1).
 
 Sign-in: the app gets a Google ID token (Credential Manager) and sends it to
-POST /api/auth/google; we verify it with Google and return our own session token
+POST /v1/auth/google; we verify it with Google and return our own session token
 (a signed JWT) for the Authorization: Bearer header.
 
-Credits: a reel already in the global library costs 0. A new analysis costs 1
-credit, charged only when it succeeds. New accounts get FREE_CREDITS once.
+Money: a reel costs UNITS_PER_REEL whether it's new or already in the global
+library; a question costs UNITS_PER_QUESTION. Units are held when the job is
+queued and refunded if it fails. New accounts get FREE_UNITS once per person.
 """
 
 import asyncio
@@ -17,9 +18,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from app import config
-from services import caption as cap, db
+from services import caption as cap
+from services import db
 
-router = APIRouter(prefix="/api", tags=["app"])
+router = APIRouter(prefix="/v1", tags=["app"])
+CHANNEL = "app"
 
 
 # ---------------------------------------------------------------- auth
@@ -38,13 +41,13 @@ def verify_google_token(token: str) -> dict:
     return claims
 
 
-def issue_session(user_id: int) -> str:
+def issue_session(account_id: int) -> str:
     now = int(time.time())
-    payload = {"sub": str(user_id), "iat": now, "exp": now + config.SESSION_DAYS * 86400}
+    payload = {"sub": str(account_id), "iat": now, "exp": now + config.SESSION_DAYS * 86400}
     return jwt.encode(payload, config.APP_SECRET, algorithm="HS256")
 
 
-async def current_user(authorization: str = Header(default="")) -> db.User:
+async def current_account(authorization: str = Header(default="")) -> db.Account:
     if not config.APP_SECRET:
         raise HTTPException(503, "App login is not configured on the server")
     scheme, _, token = authorization.partition(" ")
@@ -54,13 +57,14 @@ async def current_user(authorization: str = Header(default="")) -> db.User:
         claims = jwt.decode(token, config.APP_SECRET, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(401, "Invalid or expired session") from None
-    user = await db.get_user(int(claims["sub"]))
-    if not user:
+    account = await db.get_account(int(claims["sub"]))
+    if not account:
+        # Linking from the app side keeps this account; this only happens after a deletion.
         raise HTTPException(401, "Account not found")
-    return user
+    return account
 
 
-CurrentUser = Annotated[db.User, Depends(current_user)]
+CurrentAccount = Annotated[db.Account, Depends(current_account)]
 
 
 class GoogleLogin(BaseModel):
@@ -75,13 +79,20 @@ async def login_google(body: GoogleLogin) -> dict:
         claims = await asyncio.to_thread(verify_google_token, body.id_token)
     except Exception as e:
         raise HTTPException(401, f"Google sign-in failed: {e}") from None
-    user, created = await db.google_user(claims["sub"], claims.get("email"), claims.get("name"))
-    return {"token": issue_session(user.id), "user": user.to_dict(), "new_account": created}
+    account, created = await db.google_account(claims["sub"], claims.get("email"), claims.get("name"))
+    return {"token": issue_session(account.id), "account": account.to_dict(), "new_account": created}
 
 
 @router.get("/me")
-async def me(user: CurrentUser) -> dict:
-    return user.to_dict()
+async def me(account: CurrentAccount) -> dict:
+    ids = await db.identities(account.id)
+    return {**account.to_dict(), "linked": sorted({i["kind"] for i in ids})}
+
+
+@router.post("/link/code")
+async def link_code(account: CurrentAccount) -> dict:
+    """Code for the user to DM to the bot ("link 123456") to join their Instagram to this account."""
+    return {"code": await db.new_link_code(account.id), "expires_in": db.LINK_CODE_MINUTES * 60}
 
 
 # ---------------------------------------------------------------- reels
@@ -91,52 +102,73 @@ class ReelRequest(BaseModel):
     url: str
 
 
-@router.post("/reels")
-async def analyze_reel(body: ReelRequest, request: Request, user: CurrentUser) -> dict:
-    url = cap.find_ig_url(body.url)
-    shortcode = cap.extract_shortcode(url)
+async def _queue(account: db.Account, request: Request, **job) -> db.Job:
+    if await db.pending_jobs(account.id) >= config.MAX_PENDING_JOBS:
+        raise HTTPException(429, "Too much in progress. Wait for something to finish.")
+    created = await db.create_job(account.id, channel=CHANNEL, priority=account.priority, **job)
+    if created is None:
+        raise HTTPException(402, "Out of credits")
+    request.app.state.worker.wake()
+    return created
+
+
+@router.post("/jobs")
+async def analyze_reel(body: ReelRequest, request: Request, account: CurrentAccount) -> dict:
+    shortcode = cap.extract_shortcode(cap.find_ig_url(body.url))
     if not shortcode:
         raise HTTPException(400, "That isn't an Instagram reel or post link")
+    stage = "deliver" if await db.get_reel(shortcode) else "fetch"
+    job = await _queue(account, request, kind="reel", stage=stage, units=config.UNITS_PER_REEL, shortcode=shortcode)
+    return {"job_id": job.id, "status": job.status}
 
-    if await db.get_reel(shortcode):  # already analyzed by someone: free
-        reel, _ = await request.app.state.worker.submit(user.id, shortcode, url=url)
-        return {"status": "done", "credits_used": 0, "reel": reel.to_dict()}
 
-    pending = await db.pending_jobs(user.id)
-    if pending >= config.MAX_PENDING_JOBS:
-        raise HTTPException(429, "Too many reels in progress. Wait for one to finish.")
-    if not user.unlimited and user.credits - pending < 1:
-        raise HTTPException(402, "Out of credits")
+class Question(BaseModel):
+    question: str
 
-    reel, job = await request.app.state.worker.submit(user.id, shortcode, url=url, priority=user.priority)
-    if reel:  # analyzed by someone else a moment ago
-        return {"status": "done", "credits_used": 0, "reel": reel.to_dict()}
-    return {"status": "queued", "job_id": job.id}
+
+@router.post("/chat")
+async def ask(body: Question, request: Request, account: CurrentAccount) -> dict:
+    """Queue a question (about the last reel, else the library); poll /v1/jobs/{id} for `reply`."""
+    if not body.question.strip():
+        raise HTTPException(400, "Empty question")
+    job = await _queue(
+        account, request, kind="chat", stage="chat", units=config.UNITS_PER_QUESTION,
+        payload={"question": body.question[:2000]},
+    )
+    return {"job_id": job.id, "status": job.status}
 
 
 @router.get("/jobs/{job_id}")
-async def job_status(job_id: int, user: CurrentUser) -> dict:
+async def job_status(job_id: int, account: CurrentAccount) -> dict:
     job = await db.get_job(job_id)
-    if not job or job.user_id != user.id:
+    if not job or job.account_id != account.id:
         raise HTTPException(404, "Job not found")
-    out = {"job_id": job.id, "status": job.status, "shortcode": job.shortcode}
+    out = {"job_id": job.id, "kind": job.kind, "stage": job.stage, "status": job.status, "shortcode": job.shortcode}
     if job.status == "failed":
         out["error"] = job.error
-    if job.status == "done":
+    if job.status == "done" and job.kind == "reel":
         reel = await db.get_reel(job.shortcode)
         out["reel"] = reel.to_dict() if reel else None
+    if job.status == "done" and job.kind == "chat":
+        out["reply"] = job.payload.get("reply")
     return out
 
 
 @router.get("/library")
-async def my_library(user: CurrentUser, limit: int = 20, offset: int = 0) -> dict:
-    reels = await db.library(user.id, limit=min(max(limit, 1), 100), offset=max(offset, 0))
+async def my_library(account: CurrentAccount, q: str = "", limit: int = 20, offset: int = 0) -> dict:
+    limit = min(max(limit, 1), 100)
+    if q.strip():
+        reels = await db.search_library(account.id, q, limit=limit)
+    else:
+        reels = await db.library(account.id, limit=limit, offset=max(offset, 0))
     return {"reels": [r.to_dict() for r in reels]}
 
 
 @router.get("/reels/{shortcode}")
-async def get_reel(shortcode: str, user: CurrentUser) -> dict:
-    if not await db.in_library(user.id, shortcode):
+async def get_reel(shortcode: str, account: CurrentAccount) -> dict:
+    if not await db.in_library(account.id, shortcode):
         raise HTTPException(404, "Not in your library")
     reel = await db.get_reel(shortcode)
+    if not reel:
+        raise HTTPException(404, "Reel not available")
     return reel.to_dict()

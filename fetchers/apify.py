@@ -1,17 +1,20 @@
-"""Main fetcher: Apify's Instagram scraper actor (uses its own proxies).
+"""Reel lookup through Apify's Instagram scraper actor (Apify's proxies, never ours).
 
-Uses the run-sync-get-dataset-items endpoint: one HTTP call starts the actor,
-waits for it and returns the scraped items.
+Batched: one actor run resolves many reels (P0 spike: 13 reels in one 13 s run,
+$0.0023 per reel). Returns media URLs + caption metadata only; the analyze
+stage downloads the media, so lookup and analysis can run on different machines.
 """
 
 import logging
+from dataclasses import dataclass, field
 
 import httpx
 
 from app import config
+from services import caption as cap
 from services import keys
 
-from .base import FetchError, FetchResult, MediaFile, download
+from .base import FetchError
 
 log = logging.getLogger(__name__)
 
@@ -19,12 +22,23 @@ API = "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
 MAX_IMAGES = 5  # carousel posts: enough for Gemini to "see" the post
 
 
+@dataclass
+class ReelMeta:
+    shortcode: str
+    media: list[tuple[str, str]] = field(default_factory=list)  # (url, mime), video first
+    caption: str = ""
+    author: str | None = None
+    date: str | None = None
+
+    def to_payload(self) -> dict:
+        return {"media": self.media, "caption": self.caption, "author": self.author, "date": self.date}
+
+
 def enabled() -> bool:
     return bool(keys.apify)
 
 
 def _media_urls(item: dict) -> list[tuple[str, str]]:
-    """(url, default_mime) pairs to download, video first."""
     if item.get("videoUrl"):
         return [(item["videoUrl"], "video/mp4")]
     children = item.get("childPosts") or []
@@ -36,39 +50,29 @@ def _media_urls(item: dict) -> list[tuple[str, str]]:
     return [(u, "image/jpeg") for u in images[:MAX_IMAGES]]
 
 
-async def fetch(url: str) -> FetchResult:
+async def lookup(shortcodes: list[str]) -> dict[str, ReelMeta]:
+    """Resolve many reels in one actor run. Reels Apify couldn't get are missing from the result."""
+    if not shortcodes:
+        return {}
     run_input = {
-        "directUrls": [url],
+        "directUrls": [cap.canonical_url(s) for s in shortcodes],
         "resultsType": "posts",
         "resultsLimit": 1,
         "addParentData": False,
     }
     r = await _run_actor(run_input)
-    items = [i for i in (r.json() or []) if isinstance(i, dict) and not i.get("error")]
-    if not items:
-        raise FetchError("apify returned no items")
-    item = items[0]
-
-    urls = _media_urls(item)
-    if not urls:
-        raise FetchError("apify item has no media URL")
-
-    media: list[MediaFile] = []
-    try:
-        for media_url, mime in urls:
-            media.append(await download(media_url, mime))
-    except Exception:
-        for m in media:
-            m.path.unlink(missing_ok=True)
-        raise
-
-    return FetchResult(
-        source="apify",
-        media=media,
-        caption=item.get("caption") or "",
-        author=item.get("ownerUsername"),
-        date=item.get("timestamp"),
-    )
+    wanted, found = set(shortcodes), {}
+    for item in r.json() or []:
+        if not isinstance(item, dict) or item.get("error"):
+            continue
+        code = item.get("shortCode") or cap.extract_shortcode(item.get("url"))
+        media = _media_urls(item)
+        if code in wanted and media:
+            found[code] = ReelMeta(
+                code, media, item.get("caption") or "", item.get("ownerUsername"), item.get("timestamp")
+            )
+    log.info("apify lookup: %d/%d reels resolved", len(found), len(wanted))
+    return found
 
 
 async def _run_actor(run_input: dict) -> httpx.Response:

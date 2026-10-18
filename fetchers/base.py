@@ -29,7 +29,7 @@ class MediaFile:
 
 @dataclass
 class FetchResult:
-    source: str  # apify / yt-dlp / cobalt / forwarded
+    source: str  # meta / apify / upload
     media: list[MediaFile] = field(default_factory=list)
     caption: str | None = None  # None = fetcher had no caption info
     author: str | None = None

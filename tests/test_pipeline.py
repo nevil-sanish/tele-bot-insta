@@ -267,3 +267,27 @@ async def test_listener_failure_falls_back_to_polling(pg, monkeypatch):
 
 def test_config_defaults_sane():
     assert config.JOB_LOCK_TIMEOUT > config.JOB_HEARTBEAT * 2
+
+
+async def test_fetch_only_job_returns_media_to_the_phone(pg, monkeypatch, tmp_path):
+    calls = []
+    fake_ai(monkeypatch, tmp_path, calls)
+    fake_apify(monkeypatch, {"PH1"})
+    acc = await _account(pg)
+    job = await pg.create_job(acc.id, "fetch", "fetch", "app", units=3, shortcode="PH1")
+    await _drain(pg, None)
+    done = await pg.get_job(job.id)
+    assert done.status == "done" and done.payload["media"] == [["https://cdn/v.mp4", "video/mp4"]]
+    assert calls == [] and await pg.get_reel("PH1") is None  # no server analysis
+    assert (await pg.get_account(acc.id)).units == acc.units - 3
+
+
+async def test_fetch_only_job_for_analyzed_reel_is_free(pg, monkeypatch, tmp_path):
+    async with pg.pool().acquire() as con:
+        await pg.save_reel(con, Reel(shortcode="PH2", title="known"))
+    acc = await _account(pg)
+    job = await pg.create_job(acc.id, "fetch", "fetch", "app", units=3, shortcode="PH2")
+    await _drain(pg, None)
+    done = await pg.get_job(job.id)
+    assert done.status == "done" and done.payload["cached"] is True
+    assert await pg.in_library(acc.id, "PH2") and (await pg.get_account(acc.id)).units == acc.units

@@ -1,5 +1,6 @@
 """What each job stage does. A reel job moves fetch → analyze → deliver; a
-question is a single `chat` stage. Every stage only needs the database and the
+question is a single `chat` stage; a `fetch` job (app users with their own AI
+key) stops after fetch and returns the media URLs to the phone. Every stage only needs the database and the
 job row, so stages of one job can run on different worker machines.
 
 Money: units are reserved when the job is created (app/inbound.py, app/api.py).
@@ -56,10 +57,14 @@ async def fetch(jobs: list[Job], out: Messenger | None) -> None:
     """Find media for many reels with one Apify run."""
     todo = []
     for job in jobs:
-        if await db.get_reel(job.shortcode):  # analyzed by someone while this waited
-            await db.advance(job, "deliver")
-        else:
+        if not await db.get_reel(job.shortcode):
             todo.append(job)
+        elif job.kind == "fetch":  # the phone wanted media, but the reel is already analyzed: free
+            await db.add_to_library(job.account_id, job.shortcode, job.channel)
+            await db.refund_job(job.id)
+            await db.finish_job(job.id, cached=True)
+        else:  # analyzed by someone while this waited
+            await db.advance(job, "deliver")
     if not todo:
         return
     try:
@@ -69,7 +74,10 @@ async def fetch(jobs: list[Job], out: Messenger | None) -> None:
         found = {}
     for job in todo:
         meta = found.get(job.shortcode)
-        if meta:
+        if meta and job.kind == "fetch":
+            # App users with their own AI key: hand the media back; the phone analyzes it.
+            await db.finish_job(job.id, source="apify", **meta.to_payload())
+        elif meta:
             await db.advance(job, "analyze", source="apify", **meta.to_payload())
         else:
             await _ask_for_video(job, out, "fetch: apify could not resolve the reel")

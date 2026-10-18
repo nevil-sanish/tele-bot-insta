@@ -106,3 +106,75 @@ async def test_other_people_cannot_see_my_jobs(client):
     job_id = (await client.post("/v1/jobs", json={"url": URL}, headers=mine)).json()["job_id"]
     assert (await client.get(f"/v1/jobs/{job_id}", headers=theirs)).status_code == 404
     assert (await client.get("/v1/reels/APIREEL", headers=theirs)).status_code == 404
+
+
+RESULT = {"title": "Phone title", "summary": "S", "key_ideas": ["a"], "tags": ["Python"], "caption": "Hi #tips https://x.io",
+          "author": "bob", "model": "gemini-3.5-flash"}
+
+
+async def test_own_key_upload_is_shared_but_server_wins(client, pg):
+    headers, _ = await _login(client)
+    r = await client.post("/v1/reels/OWNKEY1/result", json=RESULT, headers=headers)
+    assert r.status_code == 200 and r.json()["title"] == "Phone title" and r.json()["source"] == "phone"
+    assert r.json()["tags"] == ["python", "tips"] and r.json()["urls"] == ["https://x.io"]
+    assert (await client.get("/v1/me", headers=headers)).json()["units"] == 20  # free
+    assert await pg.in_library((await client.get("/v1/me", headers=headers)).json()["id"], "OWNKEY1")
+
+    async with pg.pool().acquire() as con:
+        await pg.save_reel(con, Reel(shortcode="SERVER1", title="Server title"))
+    r = await client.post("/v1/reels/SERVER1/result", json=RESULT, headers=headers)
+    assert r.json()["title"] == "Server title"  # the server's analysis is kept and returned
+
+    assert (await client.post("/v1/reels/bad!code/result", json=RESULT, headers=headers)).status_code in (400, 404)
+    bad = {**RESULT, "author": "x<script>"}
+    assert (await client.post("/v1/reels/OWNKEY2/result", json=bad, headers=headers)).status_code == 422
+    long = {**RESULT, "key_ideas": ["k"] * 50}
+    assert (await client.post("/v1/reels/OWNKEY2/result", json=long, headers=headers)).status_code == 422
+
+
+async def test_upload_rate_limit(client, monkeypatch):
+    monkeypatch.setattr(config, "CLIENT_UPLOADS_PER_DAY", 1)
+    headers, _ = await _login(client)
+    assert (await client.post("/v1/reels/LIMIT1/result", json=RESULT, headers=headers)).status_code == 200
+    assert (await client.post("/v1/reels/LIMIT2/result", json=RESULT, headers=headers)).status_code == 429
+
+
+async def test_reports_hide_and_requeue(client, pg, monkeypatch):
+    monkeypatch.setattr(config, "REPORTS_TO_HIDE", 2)
+    people = [await _login(client, f"r{i}") for i in range(2)]
+    for headers, _ in people:
+        await client.post("/v1/reels/WRONG1/result", json=RESULT, headers=headers)
+    first = (await client.post("/v1/reels/WRONG1/report", json={"reason": "wrong"}, headers=people[0][0])).json()
+    again = (await client.post("/v1/reels/WRONG1/report", json={}, headers=people[0][0])).json()
+    assert first == {"reported": True, "reanalyzing": False} and again["reanalyzing"] is False  # once per person
+    second = (await client.post("/v1/reels/WRONG1/report", json={}, headers=people[1][0])).json()
+    assert second["reanalyzing"] is True
+    assert await pg.get_reel("WRONG1") is None  # hidden
+    job = await pg.claim_job()
+    assert (job.stage, job.shortcode, job.reserved) == ("fetch", "WRONG1", 0)
+
+
+async def test_server_fetch_for_own_key_users(client, pg):
+    headers, body = await _login(client)
+    r = (await client.post("/v1/fetch", json={"url": URL}, headers=headers)).json()
+    assert (await client.get("/v1/me", headers=headers)).json()["units"] == 20 - config.UNITS_PER_FETCH
+    job = await pg.claim_job()
+    assert job.kind == "fetch"
+    await pg.finish_job(job.id, media=[["https://cdn/v.mp4", "video/mp4"]], caption="c", author="bob", date=None)
+    status = (await client.get(f"/v1/jobs/{r['job_id']}", headers=headers)).json()
+    assert status["media"] == [{"url": "https://cdn/v.mp4", "mime": "video/mp4"}] and status["author"] == "bob"
+
+
+async def test_plans_and_play_not_configured(client):
+    plans = (await client.get("/v1/plans")).json()
+    assert [p["key"] for p in plans["plans"]] == ["basic", "pro"] and plans["plans"][0]["play_product_id"]
+    headers, _ = await _login(client)
+    r = await client.post("/v1/billing/play", json={"purchase_token": "x" * 20}, headers=headers)
+    assert r.status_code == 503
+
+
+async def test_delete_account(client, pg):
+    headers, body = await _login(client)
+    assert (await client.delete("/v1/me", headers=headers)).json() == {"deleted": True}
+    assert (await client.get("/v1/me", headers=headers)).status_code == 401
+    assert await pg.get_account(body["account"]["id"]) is None

@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 
 SCHEMA = Path(__file__).with_name("schema.sql")
 UNLIMITED = "unlimited"
+PAID_PLANS = ("basic", "pro")
 JOBS_CHANNEL = "reel_jobs"  # NOTIFY channel that wakes workers
 PRIORITY = {"pro": 10, "basic": 5, UNLIMITED: 5, "free": 0}  # higher plans are served first
 LINK_CODE_MINUTES = 10
@@ -72,6 +73,7 @@ class Account:
     free_granted: bool = False
     name: str | None = None
     email: str | None = None
+    plan_until: datetime | None = None
 
     @property
     def unlimited(self) -> bool:
@@ -88,11 +90,12 @@ class Account:
         return {
             "id": self.id, "plan": self.plan, "units": self.units, "reels_left": self.reels_left(),
             "name": self.name, "email": self.email,
+            "plan_until": self.plan_until.isoformat() if self.plan_until else None,
         }
 
 
 _ACCOUNT_SQL = """
-    SELECT a.id, a.plan, w.units, w.free_granted,
+    SELECT a.id, a.plan, a.plan_until, w.units, w.free_granted,
            (SELECT name FROM identities i WHERE i.account_id = a.id AND name IS NOT NULL ORDER BY i.id LIMIT 1) AS name,
            (SELECT email FROM identities i WHERE i.account_id = a.id AND email IS NOT NULL ORDER BY i.id LIMIT 1) AS email
     FROM accounts a JOIN wallets w ON w.account_id = a.id
@@ -158,6 +161,29 @@ async def identities(account_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def delete_account(account_id: int) -> None:
+    """Erase a person: identities, wallet, ledger, library, jobs, conversations and the raw
+    webhook payloads they sent. Reels stay in the global cache (public content), unlinked."""
+    async with pool().acquire() as con, con.transaction():
+        ig_ids = [r["external_id"] for r in await con.fetch(
+            "SELECT external_id FROM identities WHERE account_id = $1 AND kind = 'ig'", account_id
+        )]
+        for igsid in ig_ids:
+            await con.execute(
+                """DELETE FROM inbound_events WHERE platform = 'ig'
+                   AND payload @> jsonb_build_object('entry', jsonb_build_array(jsonb_build_object(
+                       'messaging', jsonb_build_array(jsonb_build_object('sender', jsonb_build_object('id', $1::text))))))""",
+                igsid,
+            )
+        await con.execute("DELETE FROM accounts WHERE id = $1", account_id)
+
+
+async def account_for_identity(kind: str, external_id: str) -> int | None:
+    return await pool().fetchval(
+        "SELECT account_id FROM identities WHERE kind = $1 AND external_id = $2", kind, external_id
+    )
+
+
 async def set_plan(account_id: int, plan: str) -> None:
     await pool().execute("UPDATE accounts SET plan = $2 WHERE id = $1", account_id, plan)
 
@@ -197,18 +223,22 @@ async def link_with_code(code: str, account_id: int) -> Account | None:
 
 async def _merge(con, source: int, target: int) -> None:
     src = await con.fetchrow(
-        "SELECT a.plan, w.units, w.free_granted FROM accounts a JOIN wallets w ON w.account_id = a.id WHERE a.id = $1 FOR UPDATE",
+        """SELECT a.plan, a.plan_until, w.units, w.free_granted FROM accounts a JOIN wallets w ON w.account_id = a.id
+           WHERE a.id = $1 FOR UPDATE""",
         source,
     )
     dst = await con.fetchrow(
-        "SELECT a.plan, w.units, w.free_granted FROM accounts a JOIN wallets w ON w.account_id = a.id WHERE a.id = $1 FOR UPDATE",
+        """SELECT a.plan, a.plan_until, w.units, w.free_granted FROM accounts a JOIN wallets w ON w.account_id = a.id
+           WHERE a.id = $1 FOR UPDATE""",
         target,
     )
     units = src["units"]
     if src["free_granted"] and dst["free_granted"]:
         units = max(units - config.FREE_UNITS, 0)  # one free trial per person, not per login
-    plan = max((src["plan"], dst["plan"]), key=lambda p: PRIORITY.get(p, 0))
-    await con.execute("UPDATE accounts SET plan = $2 WHERE id = $1", target, plan)
+    keep = max((src, dst), key=lambda r: PRIORITY.get(r["plan"], 0))  # the better plan wins, with its end date
+    await con.execute(
+        "UPDATE accounts SET plan = $2, plan_until = $3 WHERE id = $1", target, keep["plan"], keep["plan_until"]
+    )
     await con.execute("UPDATE wallets SET units = units + $2, free_granted = true WHERE account_id = $1", target, units)
     await con.execute(
         "INSERT INTO ledger (account_id, delta, kind, note) VALUES ($1, $2, 'merge', $3)",
@@ -228,6 +258,7 @@ async def _merge(con, source: int, target: int) -> None:
         source, target,
     )
     await con.execute("UPDATE jobs SET account_id = $2 WHERE account_id = $1", source, target)
+    await con.execute("UPDATE subscriptions SET account_id = $2 WHERE account_id = $1", source, target)
     await con.execute("UPDATE ledger SET account_id = $2 WHERE account_id = $1", source, target)
     await con.execute("DELETE FROM accounts WHERE id = $1", source)
 
@@ -252,15 +283,15 @@ async def _reserve(con, account_id: int, units: int, note: str, job_id: int | No
     return units
 
 
-async def _refund(con, job_id: int) -> None:
+async def _refund(con, job_id: int, note: str = "job failed") -> None:
     row = await con.fetchrow("SELECT account_id, reserved FROM jobs WHERE id = $1 FOR UPDATE", job_id)
     if not row or row["reserved"] <= 0:
         return
     await con.execute("UPDATE jobs SET reserved = 0 WHERE id = $1", job_id)
     await con.execute("UPDATE wallets SET units = units + $2 WHERE account_id = $1", row["account_id"], row["reserved"])
     await con.execute(
-        "INSERT INTO ledger (account_id, delta, kind, job_id, note) VALUES ($1, $2, 'refund', $3, 'job failed')",
-        row["account_id"], row["reserved"], job_id,
+        "INSERT INTO ledger (account_id, delta, kind, job_id, note) VALUES ($1, $2, 'refund', $3, $4)",
+        row["account_id"], row["reserved"], job_id, note,
     )
 
 
@@ -277,6 +308,108 @@ async def grant(account_id: int, units: int, kind: str, note: str, idem_key: str
                 "UPDATE wallets SET units = GREATEST(units + $2, 0) WHERE account_id = $1", account_id, units
             )
         return bool(applied)
+
+
+# ---------------------------------------------------------------- subscriptions
+
+
+async def upsert_subscription(
+    account_id: int, provider: str, external_id: str, plan: str, status: str, current_end: datetime | None = None
+) -> None:
+    await pool().execute(
+        """INSERT INTO subscriptions (account_id, provider, external_id, plan, status, current_end)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (provider, external_id) DO UPDATE SET
+               plan = $4, status = $5, current_end = COALESCE($6, subscriptions.current_end), updated_at = now()""",
+        account_id, provider, external_id, plan, status, current_end,
+    )
+
+
+async def subscription(provider: str, external_id: str) -> dict | None:
+    row = await pool().fetchrow(
+        "SELECT * FROM subscriptions WHERE provider = $1 AND external_id = $2", provider, external_id
+    )
+    return dict(row) if row else None
+
+
+async def live_subscription(account_id: int, provider: str | None = None) -> dict | None:
+    """The newest subscription that is paid up or waiting for its first payment."""
+    row = await pool().fetchrow(
+        """SELECT * FROM subscriptions WHERE account_id = $1 AND ($2::text IS NULL OR provider = $2)
+             AND status IN ('created', 'authenticated', 'active', 'pending')
+           ORDER BY id DESC LIMIT 1""",
+        account_id, provider,
+    )
+    return dict(row) if row else None
+
+
+async def apply_renewal(
+    account_id: int, plan: str, units: int, period_end: datetime | None, idem_key: str, note: str
+) -> bool:
+    """A paid billing cycle: switch to `plan` until `period_end` and top up to its units.
+    On a renewal the unused units of the previous paid month expire (no rollover); on a
+    first purchase leftover free units are kept. Replaying the same idem_key does nothing."""
+    async with pool().acquire() as con, con.transaction():
+        row = await con.fetchrow(
+            """SELECT a.plan, a.plan_until, w.units FROM accounts a JOIN wallets w ON w.account_id = a.id
+               WHERE a.id = $1 FOR UPDATE""",
+            account_id,
+        )
+        if row is None:
+            return False
+        applied = await con.fetchval(
+            """INSERT INTO ledger (account_id, delta, kind, note, idem_key) VALUES ($1, $2, 'purchase', $3, $4)
+               ON CONFLICT (idem_key) DO NOTHING RETURNING id""",
+            account_id, units, note, idem_key,
+        )
+        if not applied:
+            return False
+        left = row["units"]
+        if row["plan"] in PAID_PLANS and row["plan_until"] is not None and left > 0:
+            await con.execute(
+                "INSERT INTO ledger (account_id, delta, kind, note) VALUES ($1, $2, 'expire', 'previous month')",
+                account_id, -left,
+            )
+            left = 0
+        await con.execute("UPDATE wallets SET units = $2 WHERE account_id = $1", account_id, left + units)
+        if row["plan"] != UNLIMITED:
+            await con.execute(
+                "UPDATE accounts SET plan = $2, plan_until = $3 WHERE id = $1", account_id, plan, period_end
+            )
+        return True
+
+
+async def downgrade_expired(grace: timedelta = timedelta(days=1)) -> list[int]:
+    """Paid plans whose period ended (cancelled or failed renewal) go back to free; units stay."""
+    rows = await pool().fetch(
+        """UPDATE accounts SET plan = 'free', plan_until = NULL
+           WHERE plan = ANY($1::text[]) AND plan_until < now() - $2::interval RETURNING id""",
+        list(PAID_PLANS), grace,
+    )
+    return [r["id"] for r in rows]
+
+
+async def first_payment_event(provider: str, event_id: str, payload: dict | None = None) -> bool:
+    return bool(await pool().fetchval(
+        """INSERT INTO payment_events (provider, event_id, payload) VALUES ($1, $2, $3)
+           ON CONFLICT DO NOTHING RETURNING 1""",
+        provider, event_id, payload,
+    ))
+
+
+async def forget_payment_event(provider: str, event_id: str) -> None:
+    await pool().execute("DELETE FROM payment_events WHERE provider = $1 AND event_id = $2", provider, event_id)
+
+
+async def ig_recipient(account_id: int) -> str | None:
+    """The account's Instagram ID if we may message it now (inside Meta's 24-hour window)."""
+    return await pool().fetchval(
+        """SELECT i.external_id FROM identities i
+           JOIN conversations c ON c.account_id = i.account_id AND c.channel = 'ig'
+           WHERE i.account_id = $1 AND i.kind = 'ig' AND c.last_inbound_at > now() - interval '23 hours'
+           ORDER BY i.id LIMIT 1""",
+        account_id,
+    )
 
 
 # ---------------------------------------------------------------- reels + libraries
@@ -319,6 +452,43 @@ async def save_reel(con, reel: Reel, origin: str = "server", uploader_id: int | 
             WHERE reels.origin = 'client' OR EXCLUDED.origin = 'server'""",
         *_reel_values(reel), origin, uploader_id,
     )
+
+
+async def client_uploads_today(account_id: int) -> int:
+    return await pool().fetchval(
+        """SELECT count(*) FROM reels WHERE origin = 'client' AND uploader_id = $1
+           AND created_at > now() - interval '24 hours'""",
+        account_id,
+    )
+
+
+async def save_client_reel(account_id: int, reel: Reel) -> Reel:
+    """A result made on someone's phone with their own key. Shared globally, but a
+    server analysis always wins; returns whichever version is stored."""
+    async with pool().acquire() as con, con.transaction():
+        existing = await get_reel(reel.shortcode, con)
+        if existing is None:
+            await save_reel(con, reel, origin="client", uploader_id=account_id)
+        await add_to_library(account_id, reel.shortcode, "app", con)
+        return existing or await get_reel(reel.shortcode, con)
+
+
+async def report_reel(account_id: int, shortcode: str, reason: str, hide_at: int) -> bool:
+    """Record a report (once per person). Returns True when this report hid the reel."""
+    async with pool().acquire() as con, con.transaction():
+        added = await con.fetchval(
+            """INSERT INTO reel_reports (account_id, shortcode, reason) VALUES ($1, $2, $3)
+               ON CONFLICT DO NOTHING RETURNING 1""",
+            account_id, shortcode, reason[:500],
+        )
+        if not added:
+            return False
+        hidden = await con.fetchval(
+            """UPDATE reels SET reports = reports + 1, hidden = hidden OR reports + 1 >= $2
+               WHERE shortcode = $1 RETURNING hidden AND reports = $2""",
+            shortcode, hide_at,
+        )
+        return bool(hidden)
 
 
 async def add_to_library(account_id: int, shortcode: str, via: str = "ig", con=None) -> None:
@@ -587,6 +757,11 @@ async def _fail(con, job_id: int, error: str, refund: bool = True) -> None:
     )
     if refund:
         await _refund(con, job_id)
+
+
+async def refund_job(job_id: int) -> None:
+    async with pool().acquire() as con, con.transaction():
+        await _refund(con, job_id, "not needed")
 
 
 async def fail_job(job_id: int, error: str, refund: bool = True) -> None:

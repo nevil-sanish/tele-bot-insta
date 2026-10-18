@@ -28,25 +28,36 @@ Instagram user ──DM──► Meta (official Instagram API) ──signed webh
 | A reel link | Looked up on Apify, then analyzed |
 | A video file | Analyzed directly. If the bot just asked for this reel's video, the result is filed under that reel |
 | Any other text | A question about the last reel (within 30 min), else about the whole library |
-| `credits` · `new` · `help` · `link 123456` | Balance · start fresh · help · connect the Android app |
+| `credits` · `plans` · `cancel` | Balance; plans with a Razorpay payment link; stop renewing |
+| `new` · `link 123456` · `delete` · `help` | Start fresh · connect the Android app · erase your data · help |
 
-## Credits
+## Credits and plans
 
-Balances are stored as whole **units**: 1 reel = 10 units, 1 question = 1 unit. Each person gets 20 units free, once. A reel costs the same whether it's new or already in the global cache. Units are held when a job is queued and refunded if it fails before delivery. Every change is a row in `ledger`. Admins and testers listed in `ADMIN_IG_IDS` are unlimited. Paid plans (Razorpay) come in Phase 2.
+Balances are stored as whole **units**: 1 reel = 10 units, 1 question = 1 unit. Each person gets 20 units free, once.
+
+- **Plans:** monthly Basic (₹99, 30 reels) and Pro (₹299, 150 reels). Unused units don't roll over to the next month.
+- **Paying:** Instagram users pay through a Razorpay link the bot DMs (`plans`, then `cancel` to stop renewing). App users pay through Google Play.
+- **Pricing rules:** a reel costs the same whether it's new or already in the global cache. Units are held when a job is queued and refunded if it fails before delivery.
+- **Records:** every change is a row in `ledger`, and payments are applied exactly once.
+- **Own AI key:** app users with their own AI key use the app free. Only a server fetch costs 3 units.
+- **Admins:** testers listed in `ADMIN_IG_IDS` are unlimited.
+
+Setup for payments, Google sign-in, Play and Meta App Review is in [docs/SETUP_PAYMENTS.md](docs/SETUP_PAYMENTS.md). Public pages are served at `/privacy`, `/terms` and `/data-deletion`. Operational numbers are at `/admin/stats`.
 
 ## Repo layout
 
 ```
-app/       main.py (webhook, /health) · inbound.py (DM → action) · pipeline.py (stages) · worker.py (queue loop)
-           worker_main.py (ROLE=worker) · api.py (Android app API, /v1) · config.py
+app/       main.py (webhooks, /health) · inbound.py (DM → action) · pipeline.py (stages) · worker.py (queue loop)
+           worker_main.py (ROLE=worker) · api.py (Android app API, /v1) · pages.py (privacy, deletion, stats) · config.py
 channels/  instagram.py (signature check, webhook parsing, Send API, token refresh)
 fetchers/  apify.py (batched lookup) · base.py (size-capped download)
-services/  db.py + schema.sql (Postgres) · analyze.py (Gemini/Groq) · chat.py (Q&A) · keys.py (key pools)
+services/  db.py + schema.sql (Postgres) · billing.py (plans, Razorpay, Google Play) · analyze.py (Gemini/Groq)
+           chat.py (Q&A) · keys.py (key pools)
            spec.py (reads spec/analysis.json, shared with the app) · caption.py · models.py
 spec/      analysis.json: prompt, fields, video settings (the app bundles an identical copy)
 mobile/    Flutter app (in progress, Phase 3)
-scripts/   phase0_test.py (real reels end to end) · spike_apify.py (Apify batch cost)
-docs/      ARCHITECTURE.md · SETUP_META.md
+scripts/   phase0_test.py (real reels end to end) · spike_apify.py (Apify batch cost) · create_razorpay_plans.py
+docs/      ARCHITECTURE.md · SETUP_META.md · SETUP_PAYMENTS.md
 ```
 
 ## Setup

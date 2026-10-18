@@ -63,12 +63,16 @@ class Worker:
             await asyncio.sleep(30)  # then try to reconnect
 
     async def _housekeeping(self) -> None:
-        """Daily: refresh the Instagram token (about weekly) and prune old webhook records."""
+        """Daily: refresh the Instagram token (about weekly), prune old webhook records,
+        and move ended paid plans back to free."""
         while True:
             try:
                 if self.out and config.INSTAGRAM_ACCESS_TOKEN:
                     await self.out.refresh_token()
                 await db.prune_inbound()
+                downgraded = await db.downgrade_expired()
+                if downgraded:
+                    log.info("plans ended for %d accounts", len(downgraded))
             except asyncio.CancelledError:
                 raise
             except Exception as e:

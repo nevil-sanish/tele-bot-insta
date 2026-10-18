@@ -1,6 +1,7 @@
 # Reel Brain — Architecture Spec (v1 draft, for approval)
 
-Status: **approved (Oct 2026).** P0 spikes partly done (see §10.1); P1 server core built; next is Meta setup by Nevil.
+Status: **approved (Oct 2026).** All code phases are built; what's left is setup with Nevil's accounts
+(Meta, Neon, Razorpay, Google Cloud/Play) — see SETUP_META.md and SETUP_PAYMENTS.md. Details in §10.1–10.3.
 Scope is fixed to two platforms: an **Instagram DM bot** and an **Android app** (Flutter).
 No Telegram bot, no web app.
 
@@ -285,6 +286,19 @@ Rough capacity target for v1: 1,000 users, ~5,000 reels/day, p50 < 60 s end to e
 - Instagram webhook (signature, dedupe, handshake), Send API with retries and the 24-hour window error, and weekly token refresh.
 - DM commands, Q&A, and the app API under `/v1`.
 - Removed: the Telegram bot, yt-dlp, Cobalt and instaloader (they all fetched from Instagram using our servers).
+
+### 10.3 What P2–P4 built
+- **P2 payments:** Razorpay subscriptions. The DM `plans` command shows a payment link; a signed webhook applies each paid cycle exactly once. Unused units expire at renewal (A8), `cancel` stops renewal at the end of the cycle, and ended plans fall back to free daily.
+- **P3 server:**
+  - Own-key result upload: validated, rate-limited, and a server analysis always wins.
+  - "Wrong summary" reports: 3 reports hide the reel and queue a server re-analysis.
+  - Fetch-only jobs for own-key users (3 units; free if the reel is already analyzed).
+  - Plans list, Google Play purchase verification with acknowledgement, and Play renewal notifications.
+- **P3 app:** see mobile/README.md.
+- **P4:**
+  - `/privacy`, `/terms` and `/data-deletion` pages.
+  - Meta's signed data-deletion callback, the DM `delete` command and app `DELETE /v1/me`, all of which also cancel a renewing plan.
+  - `/admin/stats`.
 
 ## 11. Open questions (round 5–6, answer when ready)
 1. Hosting budget per month (₹/$)? Render vs Google Cloud Run?

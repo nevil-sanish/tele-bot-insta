@@ -5,7 +5,8 @@ from services.models import Reel
 
 async def _route(pg, text="", attachments=None, quick_reply=None, sender="u1", mid="m1"):
     account, created = await pg.ig_account(sender)
-    return await inbound.route(Inbound(sender, mid, text, attachments or [], quick_reply), account, created), account
+    reply = await inbound.route(Inbound(sender, mid, text, attachments or [], quick_reply), account, created)
+    return (reply.text if reply else None), account
 
 
 async def _jobs(pg):
@@ -102,3 +103,26 @@ def test_stand_in_keys_are_stable():
     assert inbound.stand_in_key("igu", "m1") != inbound.stand_in_key("igu", "m2")
     shortcode, url = inbound.reel_from_attachment(Attachment("share", "https://www.instagram.com/reel/XYZ/"))
     assert (shortcode, url) == ("XYZ", None)
+
+
+async def test_delete_asks_first_then_erases(pg):
+    _, account = await _route(pg, "hello")
+    await pg.add_to_library(account.id, (await _save_one(pg)).shortcode)
+    await pg.first_delivery("ig", "raw1", {"entry": [{"messaging": [{"sender": {"id": "u1"}}]}]})
+    await pg.first_delivery("ig", "raw2", {"entry": [{"messaging": [{"sender": {"id": "someone-else"}}]}]})
+    assert (await _route(pg, "delete"))[0] == inbound.DELETE_ASK
+    assert await pg.get_account(account.id) is not None
+    assert (await _route(pg, "", quick_reply="DELETE_CONFIRM"))[0] == inbound.DELETED
+    assert await pg.get_account(account.id) is None
+    left = [r["message_id"] for r in await pg.pool().fetch("SELECT message_id FROM inbound_events")]
+    assert left == ["raw2"]  # their raw messages are gone, other people's stay
+    assert await pg.get_reel("DEL1")  # public reel summaries stay in the shared cache
+    fresh, created = await pg.ig_account("u1")
+    assert created and fresh.id != account.id
+
+
+async def _save_one(pg):
+    reel = Reel(shortcode="DEL1", title="t")
+    async with pg.pool().acquire() as con:
+        await pg.save_reel(con, reel)
+    return reel

@@ -34,6 +34,33 @@ CREATE TABLE IF NOT EXISTS wallets (
     free_granted BOOLEAN NOT NULL DEFAULT false
 );
 
+-- Paid plan end (NULL = no paid plan). The plan stays until then, even after cancelling.
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS plan_until TIMESTAMPTZ;
+
+-- Recurring payments: Razorpay subscriptions (Instagram users) and Google Play subscriptions (app).
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id          BIGSERIAL PRIMARY KEY,
+    account_id  BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    provider    TEXT NOT NULL CHECK (provider IN ('razorpay', 'play')),
+    external_id TEXT NOT NULL,                        -- sub_… or a Play purchase token
+    plan        TEXT NOT NULL,
+    status      TEXT NOT NULL,                        -- created | active | pending | halted | cancelled | completed | …
+    current_end TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (provider, external_id)
+);
+CREATE INDEX IF NOT EXISTS subscriptions_account ON subscriptions (account_id, id DESC);
+
+-- Payment webhooks already handled (providers retry).
+CREATE TABLE IF NOT EXISTS payment_events (
+    provider    TEXT NOT NULL,
+    event_id    TEXT NOT NULL,
+    payload     JSONB,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (provider, event_id)
+);
+
 -- Global cache: each reel is analyzed once and shared by everyone who sends it.
 CREATE TABLE IF NOT EXISTS reels (
     shortcode      TEXT PRIMARY KEY,                  -- Instagram shortcode, or a stand-in (see db.reel_key)
@@ -66,6 +93,16 @@ ALTER TABLE reels ADD COLUMN IF NOT EXISTS search tsvector GENERATED ALWAYS AS (
         key_ideas::text || ' ' || tools::text || ' ' || tags::text || ' ' || hashtags::text)
 ) STORED;
 CREATE INDEX IF NOT EXISTS reels_search ON reels USING GIN (search);
+
+-- "This summary is wrong" reports on shared reels; enough of them hide the reel until the server re-analyzes it.
+CREATE TABLE IF NOT EXISTS reel_reports (
+    account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    shortcode  TEXT NOT NULL REFERENCES reels(shortcode) ON DELETE CASCADE,
+    reason     TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, shortcode)
+);
+CREATE INDEX IF NOT EXISTS reels_uploader ON reels (uploader_id, created_at) WHERE origin = 'client';
 
 -- Each person's library: pointers into `reels`.
 CREATE TABLE IF NOT EXISTS library (

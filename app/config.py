@@ -62,6 +62,8 @@ APP_SECRET = _str("APP_SECRET")  # signs app login tokens (any long random strin
 # OAuth client IDs whose Google ID tokens we accept (Android + web client IDs).
 GOOGLE_CLIENT_IDS = _list("GOOGLE_CLIENT_IDS")
 MAX_PENDING_JOBS = _int("MAX_PENDING_JOBS", 5)  # per account
+CLIENT_UPLOADS_PER_DAY = _int("CLIENT_UPLOADS_PER_DAY", 100)  # phone-made results shared per account
+REPORTS_TO_HIDE = _int("REPORTS_TO_HIDE", 3)  # "wrong summary" reports before a reel is re-analyzed
 SESSION_DAYS = _int("SESSION_DAYS", 30)
 
 APIFY_TOKENS = _list("APIFY_TOKENS") or ([APIFY_TOKEN] if APIFY_TOKEN else [])
@@ -72,6 +74,35 @@ UNITS_PER_REEL = _int("UNITS_PER_REEL", 10)  # new or cached, same price
 UNITS_PER_FETCH = _int("UNITS_PER_FETCH", 3)  # app users with their own key, server fetch only
 UNITS_PER_QUESTION = _int("UNITS_PER_QUESTION", 1)
 FREE_UNITS = _int("FREE_UNITS", 20)  # once per person (= 2 reels)
+
+# --- Plans (monthly; units are reset each billing month, no rollover) ---
+PLAN_BASIC_UNITS = _int("PLAN_BASIC_UNITS", 300)  # 30 reels
+PLAN_BASIC_PRICE_INR = _int("PLAN_BASIC_PRICE_INR", 99)
+PLAN_PRO_UNITS = _int("PLAN_PRO_UNITS", 1500)  # 150 reels
+PLAN_PRO_PRICE_INR = _int("PLAN_PRO_PRICE_INR", 299)
+
+# --- Razorpay (Instagram users pay through a link in the DM) ---
+RAZORPAY_KEY_ID = _str("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = _str("RAZORPAY_KEY_SECRET")
+RAZORPAY_WEBHOOK_SECRET = _str("RAZORPAY_WEBHOOK_SECRET")
+# Plan IDs (plan_…) from scripts/create_razorpay_plans.py or the Razorpay dashboard.
+RAZORPAY_PLAN_BASIC = _str("RAZORPAY_PLAN_BASIC")
+RAZORPAY_PLAN_PRO = _str("RAZORPAY_PLAN_PRO")
+RAZORPAY_TOTAL_COUNT = _int("RAZORPAY_TOTAL_COUNT", 60)  # monthly cycles before the mandate ends
+
+# --- Google Play Billing (app users) ---
+PLAY_PACKAGE_NAME = _str("PLAY_PACKAGE_NAME", "app.reelbrain")
+PLAY_PRODUCT_BASIC = _str("PLAY_PRODUCT_BASIC", "reelbrain_basic")
+PLAY_PRODUCT_PRO = _str("PLAY_PRODUCT_PRO", "reelbrain_pro")
+# Service account JSON (one line) with access to the Play Developer API.
+PLAY_SERVICE_ACCOUNT_JSON = _str("PLAY_SERVICE_ACCOUNT_JSON")
+# Shared secret in the Pub/Sub push URL: /v1/webhooks/play?token=…
+PLAY_RTDN_TOKEN = _str("PLAY_RTDN_TOKEN")
+
+# --- Launch / ops ---
+CONTACT_EMAIL = _str("CONTACT_EMAIL")  # shown on the privacy page
+BOT_USERNAME = _str("BOT_USERNAME")  # the bot's Instagram username, for links on public pages
+ADMIN_TOKEN = _str("ADMIN_TOKEN")  # bearer token for /admin/stats
 
 # --- Fetch ---
 # Our servers never fetch from Instagram themselves: media comes from the URL

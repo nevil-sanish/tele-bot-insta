@@ -51,3 +51,37 @@ def test_messages_are_deduped_and_handled_after_200(client, monkeypatch):
         r = client.post("/webhooks/instagram", content=body, headers={"X-Hub-Signature-256": sign(body)})
         assert r.status_code == 200
     assert handled == ["m1"]
+
+
+def test_razorpay_webhook_checks_signature_and_dedupes(client, monkeypatch):
+    import hashlib
+    import hmac as _hmac
+
+    from app import config
+
+    monkeypatch.setattr(config, "RAZORPAY_WEBHOOK_SECRET", "whsec")
+    seen, handled = set(), []
+
+    async def first(provider, event_id, payload):
+        new = event_id not in seen
+        seen.add(event_id)
+        return new
+
+    async def handle(event):
+        handled.append(event["event"])
+        return None, None
+
+    monkeypatch.setattr(main.db, "first_payment_event", first)
+    monkeypatch.setattr(main.billing, "handle_razorpay", handle)
+    body = json.dumps({"event": "subscription.activated", "payload": {}}).encode()
+    sig = _hmac.new(b"whsec", body, hashlib.sha256).hexdigest()
+    assert client.post("/webhooks/razorpay", content=body, headers={"X-Razorpay-Signature": "bad"}).status_code == 403
+    for _ in range(2):
+        r = client.post("/webhooks/razorpay", content=body,
+                        headers={"X-Razorpay-Signature": sig, "x-razorpay-event-id": "evt_1"})
+        assert r.status_code == 200
+    assert handled == ["subscription.activated"]
+
+
+def test_play_webhook_needs_token(client):
+    assert client.post("/v1/webhooks/play?token=nope", json={}).status_code == 403

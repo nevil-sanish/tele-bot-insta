@@ -5,3 +5,16 @@ __pycache__/
 .pytest_cache/
 tmp/
 phase0_results.json
+
+# Flutter / Android build output
+mobile/.dart_tool/
+mobile/build/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+mobile/android/.gradle/
+mobile/android/.kotlin/
+mobile/android/local.properties
+mobile/android/key.properties
+mobile/android/app/release/
+*.jks
+*.keystore

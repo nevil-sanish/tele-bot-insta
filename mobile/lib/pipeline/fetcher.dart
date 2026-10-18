@@ -10,7 +10,7 @@ import 'errors.dart';
 
 /// A reel's media downloaded to the phone, plus what the page told us about it.
 class FetchedReel {
-  FetchedReel({required this.file, required this.mimeType, this.caption, this.author, this.source = 'webview'});
+  FetchedReel({required this.file, required this.mimeType, this.caption, this.author, this.source = 'phone'});
   final File file;
   final String mimeType;
   final String? caption;
@@ -75,8 +75,8 @@ PageExtraction parseExtraction(Object? result) {
   );
 }
 
-/// Pages to try, in order: the public embed page, then the full post page
-/// (which also works for more reels if the user signed in to Instagram in Settings).
+/// Public pages to try, in order: the embed page, then the full post page.
+/// Always logged out: the app never signs in to Instagram.
 List<String> candidatePages(String shortcode) => [
       'https://www.instagram.com/reel/$shortcode/embed/captioned/',
       'https://www.instagram.com/p/$shortcode/embed/captioned/',
@@ -100,7 +100,8 @@ class WebViewFetcher implements ReelFetcher {
       if (found.hasMedia) break;
     }
     if (!found.hasMedia) {
-      throw PipelineException("Couldn't open this reel from your phone. Pick the video from your gallery instead.");
+      throw PipelineException("Couldn't open this reel from your phone (it may be private or need a login). "
+          'Pick the video from your gallery instead.');
     }
     final isVideo = found.video.isNotEmpty;
     final file = await _download(isVideo ? found.video : found.image, isVideo ? '.mp4' : '.jpg');
@@ -130,7 +131,7 @@ class WebViewFetcher implements ReelFetcher {
         }
         if (!done.isCompleted) done.complete(PageExtraction());
       },
-      onReceivedError: (_, __, ___) {
+      onReceivedError: (_, _, _) {
         if (!done.isCompleted) done.complete(PageExtraction());
       },
     );

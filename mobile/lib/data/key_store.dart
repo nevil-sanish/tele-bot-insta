@@ -1,7 +1,8 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
-/// The user's own API keys, encrypted on the device (Android Keystore).
-/// They are only ever sent to Google/Groq, never to us.
+/// Small secrets and settings, encrypted on the device (Android Keystore): the
+/// user's own API keys (only ever sent to Google/Groq, never to us), our session
+/// token, and a cached copy of the account for offline use.
 class KeyStore {
   KeyStore([FlutterSecureStorage? storage]) : _s = storage ?? const FlutterSecureStorage();
 
@@ -9,6 +10,9 @@ class KeyStore {
 
   static const gemini = 'gemini_api_key';
   static const groq = 'groq_api_key';
+  static const session = 'session_token';
+  static const account = 'account_json';
+  static const serverFetch = 'allow_server_fetch'; // '0' = never use credits to fetch
 
   Future<String?> read(String name) async {
     final v = (await _s.read(key: name))?.trim();

@@ -1,5 +1,5 @@
 /// A saved reel: text only (the video is deleted after analysis). Field names
-/// match the bot's `reels` table so libraries can be synced later.
+/// match the server's `reels` table, so the library syncs both ways.
 class Reel {
   Reel({
     required this.shortcode,
@@ -38,7 +38,7 @@ class Reel {
   final String author;
   final String? date;
   final String analysis; // full / audio-only / caption-only
-  final String source; // webview / gallery / shared-file
+  final String source; // phone / meta / apify / upload
   final String model;
 
   Map<String, dynamic> toJson() => {
@@ -91,6 +91,59 @@ class Reel {
   String get searchText => [title, summary, ...keyIdeas, ...tools, ...tags, ...hashtags, category, author].join(' ');
 }
 
+/// The signed-in person, as the server reports it.
+class Account {
+  Account({required this.id, required this.plan, required this.units, this.reelsLeft, this.name, this.email,
+      this.planUntil, this.linked = const []});
+
+  final int id;
+  final String plan; // free | basic | pro | unlimited
+  final int units;
+  final int? reelsLeft; // null = unlimited
+  final String? name;
+  final String? email;
+  final DateTime? planUntil;
+  final List<String> linked; // google, ig
+
+  bool get unlimited => plan == 'unlimited';
+  bool get instagramLinked => linked.contains('ig');
+
+  factory Account.fromJson(Map<String, dynamic> j) => Account(
+        id: j['id'] as int,
+        plan: j['plan'] as String? ?? 'free',
+        units: j['units'] as int? ?? 0,
+        reelsLeft: j['reels_left'] as int?,
+        name: j['name'] as String?,
+        email: j['email'] as String?,
+        planUntil: j['plan_until'] == null ? null : DateTime.tryParse(j['plan_until'] as String),
+        linked: [for (final x in (j['linked'] as List? ?? const [])) x.toString()],
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id, 'plan': plan, 'units': units, 'reels_left': reelsLeft, 'name': name, 'email': email,
+        'plan_until': planUntil?.toIso8601String(), 'linked': linked,
+      };
+}
+
+/// A monthly plan offered by the server (bought through Google Play in the app).
+class PlanInfo {
+  PlanInfo({required this.key, required this.title, required this.priceInr, required this.reels, required this.productId});
+
+  final String key;
+  final String title;
+  final int priceInr;
+  final int reels;
+  final String productId;
+
+  factory PlanInfo.fromJson(Map<String, dynamic> j) => PlanInfo(
+        key: j['key'] as String,
+        title: j['title'] as String,
+        priceInr: j['price_inr'] as int,
+        reels: j['reels'] as int,
+        productId: j['play_product_id'] as String,
+      );
+}
+
 enum JobStatus { queued, running, done, failed }
 
 /// One reel waiting for / going through the on-device pipeline.
@@ -104,6 +157,7 @@ class Job {
     this.step = '',
     this.error,
     this.attempts = 0,
+    this.serverJobId,
   });
 
   final int id;
@@ -114,4 +168,5 @@ class Job {
   final String step; // Fetching… / Analyzing… shown in the UI
   final String? error;
   final int attempts;
+  final int? serverJobId; // set while the server works on it (credits mode, or a server fetch)
 }

@@ -138,6 +138,7 @@ async def analyze_reel(body: ReelRequest, request: Request, account: CurrentAcco
 
 class Question(BaseModel):
     question: str
+    shortcode: str | None = None  # ask about this reel (else: the last one, then the whole library)
 
 
 @router.post("/chat")
@@ -145,6 +146,12 @@ async def ask(body: Question, request: Request, account: CurrentAccount) -> dict
     """Queue a question (about the last reel, else the library); poll /v1/jobs/{id} for `reply`."""
     if not body.question.strip():
         raise HTTPException(400, "Empty question")
+    if body.shortcode:
+        if not await db.in_library(account.id, body.shortcode):
+            raise HTTPException(404, "Not in your library")
+        conv = await db.get_conversation(account.id, CHANNEL)
+        if not conv.active or conv.active.shortcode != body.shortcode:
+            await db.set_active_reel(account.id, CHANNEL, body.shortcode)
     job = await _queue(
         account, request, kind="chat", stage="chat", units=config.UNITS_PER_QUESTION,
         payload={"question": body.question[:2000]},

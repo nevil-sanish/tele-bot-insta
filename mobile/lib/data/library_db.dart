@@ -4,8 +4,9 @@ import 'package:sqlite3/sqlite3.dart';
 
 import '../core/models.dart';
 
-/// Everything the app keeps, on the phone: the reel library (with full-text
-/// search), the job queue (survives the app being closed) and chat history.
+/// Everything the app keeps on the phone: a copy of the library (with full-text
+/// search, works offline), the job queue (survives the app being closed) and
+/// chat history. The server's library is the source of truth; see sync().
 class LibraryDb {
   LibraryDb(this.db) {
     db.execute('''
@@ -36,6 +37,13 @@ class LibraryDb {
         history   TEXT NOT NULL DEFAULT '[]'
       );
     ''');
+    _addColumn('jobs', 'server_job_id', 'INTEGER');
+    _addColumn('reels', 'pending_upload', 'INTEGER NOT NULL DEFAULT 0');
+  }
+
+  void _addColumn(String table, String column, String type) {
+    final cols = db.select('PRAGMA table_info($table)').map((r) => r['name']);
+    if (!cols.contains(column)) db.execute('ALTER TABLE $table ADD COLUMN $column $type');
   }
 
   factory LibraryDb.open(String path) => LibraryDb(sqlite3.open(path));
@@ -52,13 +60,16 @@ class LibraryDb {
     return rows.isEmpty ? null : Reel.fromJson(jsonDecode(rows.first['data'] as String) as Map<String, dynamic>);
   }
 
-  void saveReel(Reel reel) {
+  /// Insert or update a reel. [pendingUpload]: made on this phone and not yet shared with the server.
+  /// [savedAt] keeps the server's order when syncing (defaults to now).
+  void saveReel(Reel reel, {bool pendingUpload = false, int? savedAt}) {
     db.execute('BEGIN');
     try {
       db.execute(
-        'INSERT INTO reels (shortcode, data, saved_at) VALUES (?, ?, ?) '
-        'ON CONFLICT (shortcode) DO UPDATE SET data = excluded.data, saved_at = excluded.saved_at',
-        [reel.shortcode, jsonEncode(reel.toJson()), _now()],
+        'INSERT INTO reels (shortcode, data, saved_at, pending_upload) VALUES (?, ?, ?, ?) '
+        'ON CONFLICT (shortcode) DO UPDATE SET data = excluded.data, pending_upload = excluded.pending_upload, '
+        'saved_at = excluded.saved_at',
+        [reel.shortcode, jsonEncode(reel.toJson()), savedAt ?? _now(), pendingUpload ? 1 : 0],
       );
       db.execute('DELETE FROM reels_fts WHERE shortcode = ?', [reel.shortcode]);
       db.execute('INSERT INTO reels_fts (shortcode, body) VALUES (?, ?)', [reel.shortcode, reel.searchText]);
@@ -66,6 +77,20 @@ class LibraryDb {
     } catch (_) {
       db.execute('ROLLBACK');
       rethrow;
+    }
+  }
+
+  List<Reel> pendingUploads() => [
+        for (final r in db.select('SELECT data FROM reels WHERE pending_upload = 1'))
+          Reel.fromJson(jsonDecode(r['data'] as String) as Map<String, dynamic>)
+      ];
+
+  int get reelCount => db.select('SELECT count(*) AS n FROM reels').first['n'] as int;
+
+  /// Sign-out / account deletion: nothing of this person stays on the phone.
+  void clearAll() {
+    for (final t in ['reels', 'reels_fts', 'jobs', 'chats']) {
+      db.execute('DELETE FROM $t');
     }
   }
 
@@ -157,7 +182,7 @@ class LibraryDb {
 
   /// Retry a failed job, optionally with a video file the user picked.
   void retryJob(int id, {String? filePath}) => db.execute(
-        "UPDATE jobs SET status = 'queued', error = NULL, step = '', attempts = 0, "
+        "UPDATE jobs SET status = 'queued', error = NULL, step = '', attempts = 0, server_job_id = NULL, "
         'file_path = COALESCE(?, file_path), updated_at = ? WHERE id = ?',
         [filePath, _now(), id],
       );
@@ -169,6 +194,9 @@ class LibraryDb {
 
   void dismissJob(int id) => db.execute('DELETE FROM jobs WHERE id = ?', [id]);
 
+  void setServerJob(int id, int? serverJobId) =>
+      db.execute('UPDATE jobs SET server_job_id = ?, updated_at = ? WHERE id = ?', [serverJobId, _now(), id]);
+
   Job _job(Row r) => Job(
         id: r['id'] as int,
         shortcode: r['shortcode'] as String,
@@ -178,6 +206,7 @@ class LibraryDb {
         step: r['step'] as String,
         error: r['error'] as String?,
         attempts: r['attempts'] as int,
+        serverJobId: r['server_job_id'] as int?,
       );
 
   // ---------------------------------------------------------------- chat
@@ -197,5 +226,5 @@ class LibraryDb {
         [shortcode, jsonEncode(history)],
       );
 
-  void dispose() => db.dispose();
+  void dispose() => db.close();
 }

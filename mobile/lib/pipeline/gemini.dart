@@ -64,7 +64,7 @@ class GeminiClient {
         if (json) 'responseSchema': spec.responseSchema(),
         'maxOutputTokens': spec.gemini['max_output_tokens'],
         'temperature': spec.gemini['temperature'],
-        if (thinking != null) 'thinkingConfig': thinking,
+        'thinkingConfig': ?thinking,
       },
     };
   }

@@ -178,3 +178,12 @@ async def test_delete_account(client, pg):
     assert (await client.delete("/v1/me", headers=headers)).json() == {"deleted": True}
     assert (await client.get("/v1/me", headers=headers)).status_code == 401
     assert await pg.get_account(body["account"]["id"]) is None
+
+
+async def test_question_about_a_specific_reel(client, pg):
+    headers, body = await _login(client)
+    await client.post("/v1/reels/ABOUT1/result", json=RESULT, headers=headers)
+    assert (await client.post("/v1/chat", json={"question": "q", "shortcode": "NOPE1"}, headers=headers)).status_code == 404
+    await client.post("/v1/chat", json={"question": "q", "shortcode": "ABOUT1"}, headers=headers)
+    conv = await pg.get_conversation(body["account"]["id"], "app")
+    assert conv.active.shortcode == "ABOUT1"

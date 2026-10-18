@@ -58,3 +58,10 @@ def test_failed_properties_carry_reason():
     assert props["Status"]["select"]["name"] == "failed"
     assert props["Summary"]["rich_text"][0]["text"]["content"] == "Failed: boom"
     assert "Link" not in props
+
+
+def test_public_link_preferred_when_published():
+    from services.notion_store import page_link
+
+    assert page_link({"url": "https://www.notion.so/x", "public_url": "https://me.notion.site/x"}) == "https://me.notion.site/x"
+    assert page_link({"url": "https://www.notion.so/x", "public_url": None}) == "https://www.notion.so/x"

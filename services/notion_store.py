@@ -91,6 +91,11 @@ def _prop(props: dict, name: str):
     return None
 
 
+def page_link(page: dict) -> str:
+    """Public read-only link once the database is published to the web, else the private one."""
+    return page.get("public_url") or page.get("url") or ""
+
+
 def build_properties(reel: Reel, error: str = "") -> dict:
     tags = list(dict.fromkeys(_option(t) for t in reel.tags if _option(t)))[:10]
     props = {
@@ -141,7 +146,7 @@ def reel_from_page(page: dict, blocks: list[dict] | None = None) -> Reel:
         source=_prop(props, "Source") or "",
         status=_prop(props, "Status") or "",
         page_id=page.get("id", ""),
-        notion_url=page.get("url", ""),
+        notion_url=page_link(page),
     )
     if blocks:
         by_heading = {h: (attr, is_list) for h, attr, is_list in SECTIONS}
@@ -235,7 +240,7 @@ class NotionStore:
         )
         for i in range(BLOCK_BATCH, len(blocks), BLOCK_BATCH):
             await self.client.blocks.children.append(block_id=page["id"], children=blocks[i:i + BLOCK_BATCH])
-        reel.page_id, reel.notion_url = page["id"], page.get("url", "")
+        reel.page_id, reel.notion_url = page["id"], page_link(page)
         return reel
 
     async def save_failed(self, reel: Reel, reason: str) -> None:

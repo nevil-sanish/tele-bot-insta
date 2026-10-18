@@ -3,6 +3,7 @@
 import asyncio
 import hmac
 import logging
+from collections import deque
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -24,6 +25,8 @@ if not config.TELEGRAM_TOKEN:
     raise SystemExit("TELEGRAM_TOKEN is not set. Add it in Render → Environment, then redeploy.")
 
 application = build_application()
+# Telegram re-sends an update if a cold start makes it time out; remember recent IDs to drop repeats.
+_seen_updates: deque[int] = deque(maxlen=500)
 
 
 async def load_index() -> None:
@@ -78,6 +81,9 @@ async def webhook(request: Request) -> dict:
         if not hmac.compare_digest(got, config.WEBHOOK_SECRET):
             raise HTTPException(status_code=403)
     update = Update.de_json(await request.json(), application.bot)
-    # Hand off and return 200 immediately, so Telegram never retries (no duplicates).
+    if update.update_id in _seen_updates:
+        return {"ok": True}
+    _seen_updates.append(update.update_id)
+    # Hand off and return 200 immediately, so Telegram doesn't retry.
     await application.update_queue.put(update)
     return {"ok": True}

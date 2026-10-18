@@ -12,7 +12,7 @@ FastAPI on Render ─ whitelist ─ Notion shortcode cache ─ background queue
 FETCH   Apify (30 s) → yt-dlp (8 s) → Cobalt (8 s, if self-hosted) → "forward me the video"
 CAPTION fetcher metadata → instaloader (5 s) → none          (code, no LLM)
 ANALYZE Gemini, one call: fps 0.5 · LOW res · first 90 s
-        gemini-flash-latest → flash-lite-latest → 2.5-flash → Groq Whisper + LLM (audio-only)
+        gemini-3.5-flash → 3.8-flash → 3.5-flash-lite → Groq Whisper + LLM (audio-only)
           │
           ▼
 delete video ─► save Notion page ─► show result in chat
@@ -107,7 +107,7 @@ Model names and limits are environment variables, so you can change them without
 
 | Variable | Default |
 |---|---|
-| `GEMINI_MODELS` | `gemini-flash-latest,gemini-flash-lite-latest,gemini-2.5-flash` |
+| `GEMINI_MODELS` | `gemini-3.5-flash,gemini-3.8-flash,gemini-3.5-flash-lite` |
 | `GROQ_CHAT_MODELS` | `openai/gpt-oss-120b,openai/gpt-oss-20b` |
 | `GROQ_WHISPER_MODEL` | `whisper-large-v3-turbo` |
 | `APIFY_ACTOR` | `apify~instagram-scraper` |
@@ -116,7 +116,7 @@ Model names and limits are environment variables, so you can change them without
 | `COBALT_URL`, `COBALT_API_KEY` | unset, so Cobalt is skipped |
 | `WORKER_CONCURRENCY` | `2` |
 
-The `-latest` aliases always point to Google's current Flash and Flash-Lite. Pin exact IDs if you'd rather control upgrades yourself.
+When Google releases newer models, update `GEMINI_MODELS` in Render → Environment; no code change is needed. (`gemini-2.5-flash` is closed to new API keys.)
 
 ## Token savers in the code
 

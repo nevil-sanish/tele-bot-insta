@@ -40,3 +40,26 @@ async def test_both_fail_raises(monkeypatch):
 
 def test_schema_requires_every_field():
     assert set(analyze.RESPONSE_SCHEMA["required"]) == set(analyze.ReelAnalysis.model_fields)
+
+
+async def test_thinking_fallback_is_remembered_per_model(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class BadRequest(Exception):
+        code = 400
+
+    async def fake_generate(model, contents, config):
+        calls.append(config.thinking_config)
+        if config.thinking_config.thinking_level is not None and config.thinking_config.thinking_level.name == "MINIMAL":
+            raise BadRequest("Thinking level MINIMAL is not supported")
+        return SimpleNamespace(text='{"title": "t"}', usage_metadata=None)
+
+    client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=fake_generate)))
+    monkeypatch.setattr(analyze, "_gemini", lambda: client)
+    analyze._thinking_ok.clear()
+    await analyze._gemini_call("m", [], "cap")
+    assert len(calls) == 2  # MINIMAL rejected, LOW worked
+    await analyze._gemini_call("m", [], "cap")
+    assert len(calls) == 3  # second reel goes straight to LOW

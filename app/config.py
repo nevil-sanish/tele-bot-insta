@@ -57,11 +57,10 @@ MAX_DOWNLOAD_MB = _int("MAX_DOWNLOAD_MB", 100)
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/reel-brain"))
 
 # --- Analysis (Gemini) ---
-# First model that answers wins. The "-latest" aliases track Google's current
-# Flash / Flash-Lite, so new releases need no redeploy.
-GEMINI_MODELS = _list(
-    "GEMINI_MODELS", "gemini-flash-latest,gemini-flash-lite-latest,gemini-2.5-flash"
-)
+# First model that answers wins; each has its own free daily quota. 3.5 Flash is
+# first: ~10 s per reel vs ~40 s on 3.8 Flash, with the same extraction quality.
+# (gemini-2.5-flash is closed to new API keys.)
+GEMINI_MODELS = _list("GEMINI_MODELS", "gemini-3.5-flash,gemini-3.8-flash,gemini-3.5-flash-lite")
 VIDEO_FPS = _float("VIDEO_FPS", 0.5)
 VIDEO_MAX_SECONDS = _int("VIDEO_MAX_SECONDS", 90)
 INLINE_LIMIT_MB = _float("INLINE_LIMIT_MB", 19)

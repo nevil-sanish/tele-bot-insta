@@ -90,14 +90,20 @@ def _gemini():
 
 
 def _thinking_options():
-    """Minimal thinking first (Gemini 3), then budget 0 (2.5), then default."""
+    """Cheapest thinking first. Models reject levels they don't support (e.g.
+    3.8 Flash has no MINIMAL), so we step down this list on a 400."""
     from google.genai import types
 
     return [
         types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL),
+        types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
         types.ThinkingConfig(thinking_budget=0),
         None,
     ]
+
+
+# model -> index into _thinking_options() that worked, so later reels skip the failed tries.
+_thinking_ok: dict[str, int] = {}
 
 
 async def _media_parts(media: list[MediaFile], uploaded: list):
@@ -141,7 +147,9 @@ async def _gemini_call(model: str, parts: list, caption: str | None) -> Analysis
 
     contents = [types.Content(role="user", parts=[*parts, types.Part(text=_prompt(caption))])]
     last: Exception | None = None
-    for thinking in _thinking_options():
+    options = _thinking_options()
+    start = _thinking_ok.get(model, 0)
+    for i, thinking in enumerate(options[start:], start):
         cfg = types.GenerateContentConfig(
             media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
             response_mime_type="application/json",
@@ -161,6 +169,7 @@ async def _gemini_call(model: str, parts: list, caption: str | None) -> Analysis
                 last = e
                 continue
             raise
+        _thinking_ok[model] = i
         data = _parse_json(resp.text)
         u = resp.usage_metadata
         usage = {

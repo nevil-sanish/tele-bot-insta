@@ -16,15 +16,15 @@ from telegram.ext import (
 )
 
 from app import config
-from app.worker import Job, Worker, store
-from services import caption as cap, chat
+from app.worker import Worker, shortcode_for, show_result
+from services import caption as cap, chat, db
 
 log = logging.getLogger(__name__)
 
 HELP = (
     "👋 <b>Reel Brain</b>\n\n"
     "Send me an Instagram reel/post link (or forward a video) and I'll extract the caption, "
-    "speech, on-screen text and key ideas, save it to Notion, and answer questions about it.\n\n"
+    "speech, on-screen text and key ideas, save it to your library, and answer questions about it.\n\n"
     "<b>Commands</b>\n"
     "/ask &lt;question&gt; – search your whole library\n"
     "/list – recently saved reels\n"
@@ -38,6 +38,15 @@ NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 def _worker(context: ContextTypes.DEFAULT_TYPE) -> Worker:
     return context.application.bot_data["worker"]
+
+
+async def _user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> db.User:
+    """The Postgres account for this (whitelisted, so unlimited) Telegram user."""
+    cache = context.application.bot_data.setdefault("tg_users", {})
+    tg = update.effective_user
+    if tg.id not in cache:
+        cache[tg.id] = await db.telegram_user(tg.id, tg.full_name)
+    return cache[tg.id]
 
 
 async def whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -56,14 +65,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP, parse_mode=ParseMode.HTML)
 
 
+async def _submit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, url: str | None = None,
+    file_id: str | None = None, file_unique_id: str | None = None, mime_type: str = "video/mp4",
+) -> None:
+    """Saved reels are shown at once; new ones go on the persistent queue."""
+    msg = update.effective_message
+    user = await _user(update, context)
+    status = await msg.reply_text("⏳ Processing…")
+    reel, _ = await _worker(context).submit(
+        user.id, shortcode_for(url, file_unique_id), url=url, file_id=file_id, mime_type=mime_type,
+        chat_id=msg.chat_id, status_message_id=status.message_id,
+    )
+    if reel:
+        chat.set_active(msg.chat_id, reel)
+        await show_result(context.bot, msg.chat_id, status.message_id, reel, cached=True)
+
+
 async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     text = msg.text or msg.caption or ""
     urls = list(dict.fromkeys(m.group(0) for m in cap.IG_URL_RE.finditer(text)))[:5]
     for url in urls:
-        status = await msg.reply_text("⏳ Processing…")
-        job = Job(chat_id=msg.chat_id, status_message_id=status.message_id, url=url)
-        await _worker(context).handle(job)
+        await _submit(update, context, url=url)
 
 
 async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -86,17 +110,9 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     st = chat.state(msg.chat_id)
     url = cap.find_ig_url(msg.caption) or st.pending_link
     st.pending_link = None
-
-    status = await msg.reply_text("⏳ Processing…")
-    job = Job(
-        chat_id=msg.chat_id,
-        status_message_id=status.message_id,
-        url=url,
-        file_id=media.file_id,
-        file_unique_id=media.file_unique_id,
-        mime_type=mime,
+    await _submit(
+        update, context, url=url, file_id=media.file_id, file_unique_id=media.file_unique_id, mime_type=mime
     )
-    await _worker(context).handle(job)
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -105,12 +121,10 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     st = chat.state(msg.chat_id)
     url = cap.find_ig_url(msg.caption) or st.pending_link
     st.pending_link = None
-    status = await msg.reply_text("⏳ Processing…")
-    job = Job(
-        chat_id=msg.chat_id, status_message_id=status.message_id, url=url,
-        file_id=photo.file_id, file_unique_id=photo.file_unique_id, mime_type="image/jpeg",
+    await _submit(
+        update, context, url=url, file_id=photo.file_id, file_unique_id=photo.file_unique_id,
+        mime_type="image/jpeg",
     )
-    await _worker(context).handle(job)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -132,14 +146,15 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await msg.chat.send_action(ChatAction.TYPING)
     try:
-        answer, hits = await chat.ask_library(question)
+        user = await _user(update, context)
+        answer, hits = await chat.ask_library(question, only=await db.library_shortcodes(user.id))
     except Exception as e:
         log.warning("/ask failed: %s", e)
         await msg.reply_text("⚠️ Chat is unavailable right now (Groq error). Try again in a minute.")
         return
     sources = [
-        f"[{i}] <a href=\"{html.escape(r.notion_url or r.link)}\">{html.escape(r.title)}</a>"
-        if (r.notion_url or r.link) else f"[{i}] {html.escape(r.title)}"
+        f"[{i}] <a href=\"{html.escape(r.link)}\">{html.escape(r.title)}</a>" if r.link
+        else f"[{i}] {html.escape(r.title)}"
         for i, r in enumerate(hits, 1)
     ]
     text = html.escape(answer[:3500])
@@ -150,14 +165,11 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not store.enabled:
-        await msg.reply_text("Notion isn't configured.")
-        return
     try:
-        reels = await store.list_recent(10)
+        reels = await db.library((await _user(update, context)).id, limit=10)
     except Exception as e:
         log.warning("/list failed: %s", e)
-        await msg.reply_text("⚠️ Couldn't reach Notion.")
+        await msg.reply_text("⚠️ Couldn't reach the database.")
         return
     if not reels:
         await msg.reply_text("Your library is empty. Send me a reel link!")
@@ -165,29 +177,25 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["📚 <b>Recent reels</b>"]
     for r in reels:
         title = html.escape(r.title or r.shortcode)
-        lines.append(f"• <a href=\"{html.escape(r.notion_url)}\">{title}</a>" if r.notion_url else f"• {title}")
+        lines.append(f"• <a href=\"{html.escape(r.link)}\">{title}</a>" if r.link else f"• {title}")
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW)
 
 
 async def retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not store.enabled:
-        await msg.reply_text("Notion isn't configured, so there's no failed list to retry.")
-        return
     try:
-        failed = await store.list_failed(5)
+        failed = await db.failed_jobs((await _user(update, context)).id, limit=5)
     except Exception as e:
         log.warning("/retry failed: %s", e)
-        await msg.reply_text("⚠️ Couldn't reach Notion.")
+        await msg.reply_text("⚠️ Couldn't reach the database.")
         return
-    retryable = [r for r in failed if r.link]
-    if not retryable:
-        extra = " (forwarded videos without a link must be sent again)" if failed else ""
-        await msg.reply_text(f"Nothing to retry{extra}.")
+    if not failed:
+        await msg.reply_text("Nothing to retry.")
         return
-    for r in retryable:
-        status = await msg.reply_text(f"🔁 Retrying {r.link}")
-        _worker(context).submit(Job(chat_id=msg.chat_id, status_message_id=status.message_id, url=r.link))
+    for job in failed:
+        status = await msg.reply_text(f"🔁 Retrying {job.link or 'forwarded video'}")
+        await db.retry_job(job.id, chat_id=msg.chat_id, status_message_id=status.message_id)
+    _worker(context).wake()
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

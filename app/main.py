@@ -1,4 +1,4 @@
-"""FastAPI entry point: /webhook (Telegram) and /health (keep-alive pings)."""
+"""FastAPI entry point: /webhook (Telegram), /api (Android app) and /health."""
 
 import asyncio
 import hmac
@@ -10,8 +10,10 @@ from fastapi import FastAPI, HTTPException, Request
 from telegram import Update
 
 from app import config
+from app.api import router as api_router
 from app.bot import build_application
-from app.worker import Worker, store
+from app.worker import Worker
+from services import db
 from services.search import index
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -23,6 +25,8 @@ if _missing:
     log.warning("missing environment variables: %s", ", ".join(_missing))
 if not config.TELEGRAM_TOKEN:
     raise SystemExit("TELEGRAM_TOKEN is not set. Add it in Render → Environment, then redeploy.")
+if not config.DATABASE_URL:
+    raise SystemExit("DATABASE_URL is not set. Add your Neon connection string in Render → Environment.")
 
 application = build_application()
 # Telegram re-sends an update if a cold start makes it time out; remember recent IDs to drop repeats.
@@ -30,11 +34,9 @@ _seen_updates: deque[int] = deque(maxlen=500)
 
 
 async def load_index() -> None:
-    """Rebuild the in-memory BM25 index from Notion (runs after every restart)."""
-    if not store.enabled:
-        return
+    """Rebuild the in-memory BM25 index from Postgres (runs after every restart)."""
     try:
-        reels = await store.load_all()
+        reels = await db.all_reels()
         index.load(reels)
         log.info("search index loaded: %d reels", len(reels))
     except Exception as e:
@@ -42,12 +44,14 @@ async def load_index() -> None:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(fastapi_app: FastAPI):
+    await db.connect()  # also applies the schema
     await application.initialize()
     await application.start()
     worker = Worker(application.bot)
     application.bot_data["worker"] = worker
-    worker.start()
+    fastapi_app.state.worker = worker
+    worker.start()  # picks up jobs left over from before a restart
     index_task = asyncio.create_task(load_index())
     if config.PUBLIC_URL:
         await application.bot.set_webhook(
@@ -60,18 +64,21 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         index_task.cancel()
-        await worker.stop()
+        await worker.stop()  # running jobs are put back on the queue
         await application.stop()
         await application.shutdown()
+        await db.close()
 
 
 app = FastAPI(title="Reel Brain", lifespan=lifespan)
+app.include_router(api_router)
 
 
 @app.get("/health")
 @app.head("/health")
 async def health() -> dict:
-    return {"ok": True, "queued": application.bot_data["worker"].queue.qsize(), "library": len(index)}
+    # No database query here, so pings don't keep Neon awake.
+    return {"ok": True, "library": len(index)}
 
 
 @app.post("/webhook")

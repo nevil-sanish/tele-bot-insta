@@ -5,7 +5,7 @@ import threading
 
 from rank_bm25 import BM25Okapi
 
-from .notion_store import Reel
+from .models import Reel
 
 STOPWORDS = set(
     "a an and are as at be but by can do does for from how i in is it me my of on or so "
@@ -43,13 +43,16 @@ class SearchIndex:
         corpus = [tokenize(self._reels[k].search_text()) or ["_"] for k in self._order]
         self._bm25 = BM25Okapi(corpus) if corpus else None
 
-    def search(self, query: str, k: int = 3) -> list[Reel]:
+    def search(self, query: str, k: int = 3, only: set[str] | None = None) -> list[Reel]:
+        """Top-k reels for the query; `only` limits results to one user's library."""
         q = tokenize(query)
         with self._lock:
             if not self._bm25 or not q:
                 return []
             scores = self._bm25.get_scores(q)
             ranked = sorted(zip(scores, self._order), key=lambda x: x[0], reverse=True)
+            if only is not None:
+                ranked = [(s, c) for s, c in ranked if c in only]
             # BM25 can give 0 or negative scores for terms in most docs; require a real match.
             hits = [code for score, code in ranked if score > 0][:k]
             if not hits:

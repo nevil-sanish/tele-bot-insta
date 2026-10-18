@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from app import config
 
 from .analyze import groq_client
-from .notion_store import Reel
+from .models import Reel
 from .search import index
 
 log = logging.getLogger(__name__)
@@ -109,8 +109,8 @@ async def ask_active(chat_id: int, question: str) -> str:
     return answer
 
 
-async def ask_library(question: str) -> tuple[str, list[Reel]]:
-    hits = index.search(question, k=config.SEARCH_TOP_K)
+async def ask_library(question: str, only: set[str] | None = None) -> tuple[str, list[Reel]]:
+    hits = index.search(question, k=config.SEARCH_TOP_K, only=only)
     if not hits:
         return "I couldn't find any saved reels matching that. Try different keywords.", []
     per = (config.PROMPT_CHAR_BUDGET - 1000) // len(hits)

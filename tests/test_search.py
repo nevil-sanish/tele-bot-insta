@@ -1,4 +1,4 @@
-from services.notion_store import Reel
+from services.models import Reel
 from services.search import SearchIndex
 
 

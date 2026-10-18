@@ -12,5 +12,5 @@ def test_missing_required_lists_names_only(monkeypatch):
     for name in config.REQUIRED:
         monkeypatch.setenv(name, "v")
     monkeypatch.setenv("GROQ_API_KEY", " ")
-    monkeypatch.delenv("NOTION_TOKEN")
-    assert config.missing_required() == ["GROQ_API_KEY", "NOTION_TOKEN"]
+    monkeypatch.delenv("DATABASE_URL")
+    assert config.missing_required() == ["GROQ_API_KEY", "DATABASE_URL"]

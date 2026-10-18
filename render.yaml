@@ -17,9 +17,11 @@ services:
         sync: false
       - key: APIFY_TOKEN
         sync: false
-      - key: NOTION_TOKEN
+      - key: DATABASE_URL
         sync: false
-      - key: NOTION_DATABASE_ID
+      - key: APP_SECRET
+        sync: false
+      - key: GOOGLE_CLIENT_IDS
         sync: false
       - key: COBALT_URL
         sync: false

@@ -1,10 +1,13 @@
-"""Background queue: the webhook returns 200 at once, and reels are processed
-here with live status edits (Fetching… → Analyzing… → Saving…)."""
+"""Background processing on a persistent Postgres job queue.
+
+The webhook returns 200 at once; jobs live in the `jobs` table, so a crash or
+redeploy never loses a reel: interrupted jobs are put back (or taken over once
+their heartbeat stops) and resume, editing the same Telegram status message.
+"""
 
 import asyncio
 import html
 import logging
-from dataclasses import dataclass
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.constants import ParseMode
@@ -13,35 +16,23 @@ from telegram.error import BadRequest
 from app import config
 from fetchers import chain
 from fetchers.base import FetchError, FetchResult, MediaFile, new_tmp_path
-from services import analyze, caption as cap, chat
-from services.notion_store import NotionStore, Reel
+from services import analyze, caption as cap, chat, db
+from services.db import Job
+from services.models import Reel
 from services.search import index
 
 log = logging.getLogger(__name__)
 
-store = NotionStore()
 
-
-@dataclass
-class Job:
-    chat_id: int
-    status_message_id: int
-    url: str | None = None  # Instagram link
-    file_id: str | None = None  # forwarded Telegram video
-    file_unique_id: str | None = None
-    mime_type: str = "video/mp4"
-
-    @property
-    def shortcode(self) -> str:
-        return cap.extract_shortcode(self.url) or f"tg_{self.file_unique_id}"
+def shortcode_for(url: str | None, file_unique_id: str | None = None) -> str | None:
+    return cap.extract_shortcode(url) or (f"tg_{file_unique_id}" if file_unique_id else None)
 
 
 class Worker:
-    def __init__(self, bot: Bot) -> None:
+    def __init__(self, bot: Bot | None) -> None:
         self.bot = bot
-        self.queue: asyncio.Queue[Job] = asyncio.Queue()
-        # shortcode -> jobs from other chats that asked for the same reel while it was running
-        self.in_flight: dict[str, list[Job]] = {}
+        self._wake = asyncio.Event()
+        self._claim_lock = asyncio.Lock()
         self._tasks: list[asyncio.Task] = []
 
     def start(self, n: int = config.WORKER_CONCURRENCY) -> None:
@@ -52,52 +43,72 @@ class Worker:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def handle(self, job: Job) -> None:
-        """Entry point for every reel: saved results are shown at once, new reels are queued."""
-        if await show_cached(self.bot, job):
-            return
-        if not self.submit(job):
-            await _status(self.bot, job, "⏳ This reel is being analyzed right now. I'll post the result here.")
+    def wake(self) -> None:
+        self._wake.set()
 
-    def submit(self, job: Job) -> bool:
-        """Queue a reel. If it's already queued/running, the job waits for that run instead
-        (it then gets the saved result) and this returns False."""
-        if job.shortcode in self.in_flight:
-            self.in_flight[job.shortcode].append(job)
-            return False
-        self.in_flight[job.shortcode] = []
-        self.queue.put_nowait(job)
-        return True
+    async def submit(self, user_id: int, shortcode: str, **job_fields) -> tuple[Reel | None, Job | None]:
+        """Saved reel → (reel, None), added to the user's library at no cost.
+        New reel → (None, job) queued for analysis."""
+        reel = await db.get_reel(shortcode)
+        if reel:
+            await db.add_to_library(user_id, shortcode)
+            return reel, None
+        job = await db.enqueue(user_id, shortcode, **job_fields)
+        self.wake()
+        return None, job
 
     async def _loop(self) -> None:
         while True:
-            job = await self.queue.get()
+            self._wake.clear()
             try:
-                await self._run(job)
-                # Chats that sent the same reel meanwhile now get the saved result (0 tokens).
-                for waiter in self.in_flight.pop(job.shortcode, []):
-                    await self._run(waiter)
-            finally:
-                self.in_flight.pop(job.shortcode, None)
-                self.queue.task_done()
+                async with self._claim_lock:
+                    job = await db.claim_job()
+            except Exception as e:
+                log.warning("queue claim failed: %s", e)
+                await asyncio.sleep(5)
+                continue
+            if job is None:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=config.QUEUE_IDLE_POLL)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            await self._run(job)
 
     async def _run(self, job: Job) -> None:
+        beat = asyncio.create_task(self._heartbeat(job.id))
         try:
             await process(self.bot, job)
-        except Exception:
-            log.exception("job crashed: %s", job)
+        except asyncio.CancelledError:
+            # Shutting down (redeploy): hand the job back so the next instance resumes it.
+            await asyncio.shield(db.requeue(job.id))
+            raise
+        except Exception as e:
+            log.exception("job %s crashed", job.id)
+            await db.fail_job(job.id, f"crash: {type(e).__name__}: {e}")
             await _status(self.bot, job, "❌ Something went wrong. Try /retry later.")
+        finally:
+            beat.cancel()
+            self.wake()  # jobs waiting on this reel can run now
+
+    async def _heartbeat(self, job_id: int) -> None:
+        while True:
+            await asyncio.sleep(config.JOB_HEARTBEAT)
+            try:
+                await db.heartbeat(job_id)
+            except Exception as e:
+                log.warning("heartbeat failed for job %s: %s", job_id, e)
 
 
 # ---------------------------------------------------------------- pipeline
 
 
-async def process(bot: Bot, job: Job) -> None:
-    shortcode = job.shortcode
-    link = cap.canonical_url(shortcode) if job.url else ""
-
-    # 1. Cache: already in Notion (analyzed by anyone) → show it, 0 tokens.
-    if await show_cached(bot, job):
+async def process(bot: Bot | None, job: Job) -> None:
+    # 1. Cache: analyzed before (by anyone) → reuse it, 0 tokens, no credit.
+    cached = await db.get_reel(job.shortcode)
+    if cached:
+        await db.finish_job(job, cached, analyzed=False)
+        await _show(bot, job, cached, cached=True)
         return
 
     # 2. Fetch (or download the forwarded file).
@@ -105,9 +116,10 @@ async def process(bot: Bot, job: Job) -> None:
     try:
         fetched = await _fetch(bot, job)
     except FetchError as e:
-        log.warning("all fetchers failed for %s: %s", shortcode, e)
-        chat.state(job.chat_id).pending_link = job.url
-        await _save_failed(Reel(shortcode=shortcode, link=link), f"fetch: {e}")
+        log.warning("all fetchers failed for %s: %s", job.shortcode, e)
+        await db.fail_job(job.id, f"fetch: {e}")
+        if job.chat_id:
+            chat.state(job.chat_id).pending_link = job.url
         await _status(
             bot, job,
             "😕 Couldn't fetch this reel. Forward me the video (or save it and send it here, "
@@ -119,74 +131,46 @@ async def process(bot: Bot, job: Job) -> None:
         # 3. Caption by code; instaloader only if the fetcher had none.
         caption_text = fetched.caption or ""
         if not caption_text and job.url:
-            extra = await cap.instaloader_caption(shortcode)
+            extra = await cap.instaloader_caption(job.shortcode)
             if extra:
                 caption_text = extra["caption"]
                 fetched.author = fetched.author or extra["author"]
                 fetched.date = fetched.date or extra["date"]
 
-        # 4. One Gemini call (with fallbacks).
+        # 4. One AI call (with fallbacks).
         await _status(bot, job, "🧠 Analyzing…")
         try:
             result = await analyze.analyze(fetched.media, caption_text)
         except analyze.AnalysisError as e:
-            log.warning("analysis failed for %s: %s", shortcode, e)
-            await _save_failed(
-                Reel(shortcode=shortcode, link=link, author=fetched.author or "", source=fetched.source),
-                f"analysis: {e}",
-            )
+            log.warning("analysis failed for %s: %s", job.shortcode, e)
+            await db.fail_job(job.id, f"analysis: {e}")
             await _status(bot, job, "❌ Analysis failed (AI quota or service error). Use /retry later.")
             return
     finally:
         # 5. Only text is kept.
         fetched.cleanup()
 
-    reel = build_reel(shortcode, link, fetched, caption_text, result)
-
-    # 6. Save to Notion.
-    if store.enabled:
-        await _status(bot, job, "💾 Saving…")
-        try:
-            await store.save(reel)
-        except Exception as e:
-            log.exception("notion save failed")
-            reel.notion_url = ""
-            reel.status = f"not saved ({type(e).__name__})"
+    # 6. Save to the global cache + the user's library; charge a credit on credit plans.
+    reel = build_reel(job, fetched, caption_text, result)
+    await _status(bot, job, "💾 Saving…")
+    await db.finish_job(job, reel, analyzed=True)
     index.add(reel)
-    chat.set_active(job.chat_id, reel)
-    await _status(bot, job, format_result(reel), reel=reel)
-    if not job.url:
+    await _show(bot, job, reel)
+    if job.chat_id and not job.url:
         await bot.send_message(
             job.chat_id,
             "Tip: send the video with the reel link as its caption to include the original caption.",
         )
 
 
-async def show_cached(bot: Bot, job: Job) -> bool:
-    """If this reel is already in the Notion library, show the saved result and return True."""
-    if not store.enabled:
-        return False
-    try:
-        cached = await store.find(job.shortcode)
-    except Exception as e:
-        log.warning("notion cache lookup failed: %s", e)
-        return False
-    if not cached:
-        return False
-    log.info("cache hit: %s", job.shortcode)
-    chat.set_active(job.chat_id, cached)
-    await _status(bot, job, format_result(cached, cached=True), reel=cached)
-    return True
-
-
-def build_reel(shortcode: str, link: str, fetched: FetchResult, caption_text: str, result) -> Reel:
+def build_reel(job: Job, fetched: FetchResult, caption_text: str, result) -> Reel:
     d = result.data
     hashtags = cap.extract_hashtags(caption_text)
-    # Gemini's topic tags first, then the author's hashtags, max 10 for Notion.
+    # Topic tags from the AI first, then the author's hashtags, max 10.
     tags = list(dict.fromkeys([t.lower().lstrip("#") for t in d.tags] + [h.lower() for h in hashtags]))[:10]
     return Reel(
-        shortcode=shortcode,
-        link=link,
+        shortcode=job.shortcode,
+        link=job.link,
         title=d.title or "Untitled reel",
         summary=d.summary,
         key_ideas=d.key_ideas[:5],
@@ -202,10 +186,11 @@ def build_reel(shortcode: str, link: str, fetched: FetchResult, caption_text: st
         date=fetched.date,
         analysis=result.mode,
         source=fetched.source,
+        model=result.model,
     )
 
 
-async def _fetch(bot: Bot, job: Job) -> FetchResult:
+async def _fetch(bot: Bot | None, job: Job) -> FetchResult:
     if job.file_id:
         tg_file = await bot.get_file(job.file_id)
         ext = ".mp4" if job.mime_type.startswith("video/") else ".jpg"
@@ -213,15 +198,6 @@ async def _fetch(bot: Bot, job: Job) -> FetchResult:
         await tg_file.download_to_drive(path)
         return FetchResult(source="forwarded", media=[MediaFile(path, job.mime_type)], caption=None)
     return await chain.fetch(job.url)
-
-
-async def _save_failed(reel: Reel, reason: str) -> None:
-    if not store.enabled:
-        return
-    try:
-        await store.save_failed(reel, reason)
-    except Exception as e:
-        log.warning("could not record failure in Notion: %s", e)
 
 
 # ---------------------------------------------------------------- telegram output
@@ -249,11 +225,9 @@ def format_result(reel: Reel, cached: bool = False) -> str:
         lines.append("🏷 " + " ".join("#" + e(t.replace(" ", "_")) for t in reel.tags[:8]))
     notes = []
     if cached:
-        notes.append("from your library")
+        notes.append("from the library")
     if reel.analysis and reel.analysis != "full":
         notes.append(f"analysis: {reel.analysis}")
-    if reel.status not in ("", "done"):
-        notes.append(reel.status)
     if notes:
         lines.append(f"\n<i>({e(', '.join(notes))})</i>")
     lines.append("\n💬 Ask me anything about this reel.")
@@ -261,29 +235,37 @@ def format_result(reel: Reel, cached: bool = False) -> str:
     return text if len(text) <= 4000 else text[:3990] + "…"
 
 
-def _buttons(reel: Reel | None):
-    if not reel:
-        return None
-    row = []
-    if reel.notion_url:
-        row.append(InlineKeyboardButton("Open in Notion", url=reel.notion_url))
-    if reel.link:
-        row.append(InlineKeyboardButton("Open reel", url=reel.link))
-    return InlineKeyboardMarkup([row]) if row else None
+def _buttons(reel: Reel):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Open reel", url=reel.link)]]) if reel.link else None
 
 
-async def _status(bot: Bot, job: Job, text: str, reel: Reel | None = None) -> None:
-    """Edit the job's status message; fall back to a new message if editing fails."""
-    kwargs = {}
-    if reel is not None:
-        kwargs = {
-            "parse_mode": ParseMode.HTML,
-            "reply_markup": _buttons(reel),
-            "link_preview_options": LinkPreviewOptions(is_disabled=True),
-        }
+async def _show(bot: Bot | None, job: Job, reel: Reel, cached: bool = False) -> None:
+    if job.chat_id and bot:
+        chat.set_active(job.chat_id, reel)
+        await show_result(bot, job.chat_id, job.status_message_id, reel, cached)
+
+
+async def show_result(bot: Bot, chat_id: int, message_id: int | None, reel: Reel, cached: bool = False) -> None:
+    await _edit(
+        bot, chat_id, message_id, format_result(reel, cached),
+        parse_mode=ParseMode.HTML, reply_markup=_buttons(reel),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def _status(bot: Bot | None, job: Job, text: str) -> None:
+    """Live status for Telegram jobs; app jobs are polled instead."""
+    if job.chat_id and bot:
+        await _edit(bot, job.chat_id, job.status_message_id, text)
+
+
+async def _edit(bot: Bot, chat_id: int, message_id: int | None, text: str, **kwargs) -> None:
+    """Edit the status message; fall back to a new message if that fails."""
     try:
-        await bot.edit_message_text(text, chat_id=job.chat_id, message_id=job.status_message_id, **kwargs)
+        if message_id is None:
+            raise BadRequest("no status message")
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, **kwargs)
     except BadRequest as e:
         if "not modified" in str(e).lower():
             return
-        await bot.send_message(job.chat_id, text, **kwargs)
+        await bot.send_message(chat_id, text, **kwargs)

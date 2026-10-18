@@ -1,7 +1,7 @@
 import json
 
 from services import chat
-from services.notion_store import Reel
+from services.models import Reel
 
 
 async def test_history_is_capped_and_reset(monkeypatch):
@@ -32,7 +32,7 @@ def test_reel_context_respects_budget():
 async def test_ask_library_uses_top_hits(monkeypatch):
     from services.search import index
 
-    index.load([Reel(shortcode="1", title="Notion setup", summary="databases and templates", notion_url="u")])
+    index.load([Reel(shortcode="1", title="Notion setup", summary="databases and templates")])
     seen = {}
 
     async def fake_complete(messages, max_tokens=700):

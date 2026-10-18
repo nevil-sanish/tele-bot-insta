@@ -42,8 +42,15 @@ GROQ_API_KEY = _str("GROQ_API_KEY")
 APIFY_TOKEN = _str("APIFY_TOKEN")
 COBALT_URL = _str("COBALT_URL")
 COBALT_API_KEY = _str("COBALT_API_KEY")
-NOTION_TOKEN = _str("NOTION_TOKEN")
-NOTION_DATABASE_ID = _str("NOTION_DATABASE_ID")
+
+# --- Database + accounts ---
+DATABASE_URL = _str("DATABASE_URL")  # Neon Postgres connection string
+APP_SECRET = _str("APP_SECRET")  # signs app login tokens (any long random string)
+# OAuth client IDs whose Google ID tokens we accept (Android + web client IDs).
+GOOGLE_CLIENT_IDS = _list("GOOGLE_CLIENT_IDS")
+FREE_CREDITS = _int("FREE_CREDITS", 10)  # given once to each new app account
+MAX_PENDING_JOBS = _int("MAX_PENDING_JOBS", 5)  # per app user
+SESSION_DAYS = _int("SESSION_DAYS", 30)
 
 # --- Fetch ---
 APIFY_ACTOR = os.getenv("APIFY_ACTOR", "apify~instagram-scraper")
@@ -74,13 +81,18 @@ CHAT_HISTORY_TURNS = _int("CHAT_HISTORY_TURNS", 4)
 PROMPT_CHAR_BUDGET = _int("PROMPT_CHAR_BUDGET", 14000)
 SEARCH_TOP_K = _int("SEARCH_TOP_K", 3)
 
-# --- Worker ---
+# --- Worker / job queue ---
 WORKER_CONCURRENCY = _int("WORKER_CONCURRENCY", 2)
+JOB_MAX_ATTEMPTS = _int("JOB_MAX_ATTEMPTS", 3)  # crashes/redeploys before a job is marked failed
+JOB_LOCK_TIMEOUT = _int("JOB_LOCK_TIMEOUT", 180)  # s without a heartbeat before a job is taken over
+JOB_HEARTBEAT = _int("JOB_HEARTBEAT", 30)
+# Idle re-check of the queue. Long, so Neon can scale to zero while nothing happens.
+QUEUE_IDLE_POLL = _int("QUEUE_IDLE_POLL", 600)
 
 
 REQUIRED = [
     "TELEGRAM_TOKEN", "WEBHOOK_SECRET", "ALLOWED_USER_IDS", "GEMINI_API_KEY",
-    "GROQ_API_KEY", "APIFY_TOKEN", "NOTION_TOKEN", "NOTION_DATABASE_ID",
+    "GROQ_API_KEY", "APIFY_TOKEN", "DATABASE_URL",
 ]
 
 

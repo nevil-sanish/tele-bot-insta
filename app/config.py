@@ -5,8 +5,13 @@ import os
 from pathlib import Path
 
 
+def _str(name: str, default: str = "") -> str:
+    """Env value with stray whitespace and wrapping quotes removed (common copy-paste slips)."""
+    return (os.getenv(name) or default).strip().strip("'\"").strip()
+
+
 def _list(name: str, default: str = "") -> list[str]:
-    return [x.strip() for x in os.getenv(name, default).split(",") if x.strip()]
+    return [x.strip() for x in _str(name, default).split(",") if x.strip()]
 
 
 def _int(name: str, default: int) -> int:
@@ -24,21 +29,21 @@ def _float(name: str, default: float) -> float:
 
 
 # --- Telegram ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+TELEGRAM_TOKEN = _str("TELEGRAM_TOKEN")
+WEBHOOK_SECRET = _str("WEBHOOK_SECRET")
 ALLOWED_USER_IDS = {int(x) for x in _list("ALLOWED_USER_IDS") if x.lstrip("-").isdigit()}
 # Render sets RENDER_EXTERNAL_URL automatically; PUBLIC_URL overrides it.
-PUBLIC_URL = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
+PUBLIC_URL = _str("PUBLIC_URL") or _str("RENDER_EXTERNAL_URL")
 TELEGRAM_MAX_FILE_MB = 20
 
 # --- Keys ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
-COBALT_URL = os.getenv("COBALT_URL", "")
-COBALT_API_KEY = os.getenv("COBALT_API_KEY", "")
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
+GEMINI_API_KEY = _str("GEMINI_API_KEY")
+GROQ_API_KEY = _str("GROQ_API_KEY")
+APIFY_TOKEN = _str("APIFY_TOKEN")
+COBALT_URL = _str("COBALT_URL")
+COBALT_API_KEY = _str("COBALT_API_KEY")
+NOTION_TOKEN = _str("NOTION_TOKEN")
+NOTION_DATABASE_ID = _str("NOTION_DATABASE_ID")
 
 # --- Fetch ---
 APIFY_ACTOR = os.getenv("APIFY_ACTOR", "apify~instagram-scraper")
@@ -72,3 +77,14 @@ SEARCH_TOP_K = _int("SEARCH_TOP_K", 3)
 
 # --- Worker ---
 WORKER_CONCURRENCY = _int("WORKER_CONCURRENCY", 2)
+
+
+REQUIRED = [
+    "TELEGRAM_TOKEN", "WEBHOOK_SECRET", "ALLOWED_USER_IDS", "GEMINI_API_KEY",
+    "GROQ_API_KEY", "APIFY_TOKEN", "NOTION_TOKEN", "NOTION_DATABASE_ID",
+]
+
+
+def missing_required() -> list[str]:
+    """Names (never values) of required settings that are unset or empty."""
+    return [name for name in REQUIRED if not _str(name)]

@@ -17,6 +17,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("reel-brain")
 
+_missing = config.missing_required()
+if _missing:
+    log.warning("missing environment variables: %s", ", ".join(_missing))
+if not config.TELEGRAM_TOKEN:
+    raise SystemExit("TELEGRAM_TOKEN is not set. Add it in Render → Environment, then redeploy.")
+
 application = build_application()
 
 
